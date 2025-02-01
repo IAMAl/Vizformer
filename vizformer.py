@@ -2,1253 +2,1044 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from pyvis.network import Network
-import streamlit.components.v1 as components
-import tempfile
-import os
-import json  # パラメータ保存・読み込み用
-import base64  # ファイルダウンロード用
-import re  # 正規表現用
+import json
+import base64
+import re
 
-# バージョン情報
-VERSION = "0.01.00"
+LN_FACTOR = 5
 
-# ページ設定
-st.set_page_config(layout="wide")  # 表示幅を広げる
-
-# タイトルと説明
-st.title(f"Transformerモデルのパラメータ可視化ツール")
-
-st.write(f"""
-Version: {VERSION}
-""")
-
-st.write(f"""
-このツールでは、Transformerモデルの主要なパラメータを調整し、
-モデルの各モジュールの詳細な入出力テンソルサイズ、重みとバイアスの数、計算量、
-および詳細なメモリ使用量の内訳を可視化します。
-""")
-
-# デフォルトのパラメータ値を設定
-default_params = {
-    'batch_size': 32,
-    'L_s': 50,
-    'L_t': 50,
-    'd_model': 512,
-    'N_enc': 6,
-    'N_dec': 6,
-    'h': 8,
-    'd_ff': 2048,
-    'V_src': 30000,
-    'V_tgt': 30000,
-    'dtype_str': 'float32 (4バイト)',
-    'use_kv_cache': False,
-    'use_flash_attention': False,
-    'tile_size_m': 128,
-    'tile_size_n': 128,
-    'tile_size_k': 64
-}
-
-# パラメータの保存・読み込み用関数
-def save_parameters(params):
-    json_str = json.dumps(params, ensure_ascii=False, indent=4)
-    b64 = base64.b64encode(json_str.encode()).decode()
-    href = f'<a href="data:file/json;base64,{b64}" download="parameters.json">パラメータをダウンロード</a>'
-    st.sidebar.markdown(href, unsafe_allow_html=True)
-
-def load_parameters():
-    uploaded_file = st.sidebar.file_uploader("パラメータファイルを選択してください", type=["json"])
-    if uploaded_file is not None:
-        try:
-            json_str = uploaded_file.read().decode()
-            params = json.loads(json_str)
-            return params
-        except Exception as e:
-            st.sidebar.error(f"パラメータの読み込みに失敗しました: {e}")
-    return None
-
-# サイドバーでパラメータの入力
-st.sidebar.header("モデルパラメータの設定")
-
-# パラメータのリセットボタン
-if st.sidebar.button("パラメータをリセット"):
-    st.session_state['params'] = default_params.copy()
-else:
-    # セッションステートにパラメータがない場合、デフォルト値を設定
-    if 'params' not in st.session_state:
-        st.session_state['params'] = default_params.copy()
-
-# パラメータの読み込み
-loaded_params = load_parameters()
-if loaded_params:
-    st.session_state['params'] = loaded_params
-    st.sidebar.success("パラメータを読み込みました。")
-
-params = st.session_state['params']
-
-# パラメータ入力
-batch_size = st.sidebar.number_input("バッチサイズ (batch_size)", min_value=1, value=params['batch_size'])
-L_s = st.sidebar.number_input("ソースシーケンス長 (L_s)", min_value=1, value=params['L_s'])
-L_t = st.sidebar.number_input("ターゲットシーケンス長 (L_t)", min_value=1, value=params['L_t'])
-d_model = st.sidebar.number_input("埋め込み次元数 (d_model)", min_value=1, value=params['d_model'])
-N_enc = st.sidebar.number_input("エンコーダのレイヤー数 (N_enc)", min_value=1, value=params['N_enc'])
-N_dec = st.sidebar.number_input("デコーダのレイヤー数 (N_dec)", min_value=1, value=params['N_dec'])
-h = st.sidebar.number_input("アテンションヘッド数 (h)", min_value=1, value=params['h'])
-d_ff = st.sidebar.number_input("フィードフォワードネットワークの次元数 (d_ff)", min_value=1, value=params['d_ff'])
-V_src = st.sidebar.number_input("ソース語彙サイズ (V_src)", min_value=1, value=params['V_src'])
-V_tgt = st.sidebar.number_input("ターゲット語彙サイズ (V_tgt)", min_value=1, value=params['V_tgt'])
-
-# データ型の選択
-dtype_options = {
-    'float64 (8バイト)': 8,
-    'float32 (4バイト)': 4,
-    'float16 (2バイト)': 2,
-    'int8 (1バイト)': 1
-}
-dtype_str = st.sidebar.selectbox("データ型の選択", options=list(dtype_options.keys()), index=list(dtype_options.keys()).index(params['dtype_str']))
-precision = dtype_options[dtype_str]
-
-# KVキャッシュの有無
-use_kv_cache = st.sidebar.checkbox("デコーダでKVキャッシュを使用する", value=params['use_kv_cache'])
-
-# FlashAttentionの有無
-use_flash_attention = st.sidebar.checkbox("FlashAttentionを使用する", value=params['use_flash_attention'])
-
-# タイルサイズの設定（FlashAttention用）
-if use_flash_attention:
-    st.sidebar.subheader("タイルサイズの設定（FlashAttention）")
-    tile_size_m = st.sidebar.number_input("タイルサイズ（M次元）", min_value=1, value=params['tile_size_m'])
-    tile_size_n = st.sidebar.number_input("タイルサイズ（N次元）", min_value=1, value=params['tile_size_n'])
-    tile_size_k = st.sidebar.number_input("タイルサイズ（K次元）", min_value=1, value=params['tile_size_k'])
-else:
-    tile_size_m = tile_size_n = tile_size_k = None
-
-# 現在のパラメータをセッションステートに保存
-st.session_state['params'] = {
-    'batch_size': batch_size,
-    'L_s': L_s,
-    'L_t': L_t,
-    'd_model': d_model,
-    'N_enc': N_enc,
-    'N_dec': N_dec,
-    'h': h,
-    'd_ff': d_ff,
-    'V_src': V_src,
-    'V_tgt': V_tgt,
-    'dtype_str': dtype_str,
-    'use_kv_cache': use_kv_cache,
-    'use_flash_attention': use_flash_attention,
-    'tile_size_m': tile_size_m if tile_size_m else 128,
-    'tile_size_n': tile_size_n if tile_size_n else 128,
-    'tile_size_k': tile_size_k if tile_size_k else 64
-}
-
-# パラメータの保存ボタン
-if st.sidebar.button("パラメータを保存"):
-    save_parameters(st.session_state['params'])
-
-# メモリ使用量の単位変換
-def format_memory_size(bytes_size):
-    if bytes_size >= 1024 ** 3:
-        return f"{bytes_size / (1024 ** 3):.2f} GB"
-    elif bytes_size >= 1024 ** 2:
-        return f"{bytes_size / (1024 ** 2):.2f} MB"
-    elif bytes_size >= 1024:
-        return f"{bytes_size / 1024:.2f} KB"
+def parse_int_value(x):
+    if isinstance(x, str):
+        x = x.replace('(SingleTile)', '')
+        x = x.replace(',', '')
+        x = x.strip()
+        m = re.search(r'(\d+)', x)
+        if m:
+            return int(m.group(1))
+        else:
+            return 0
     else:
-        return f"{bytes_size} B"
+        return int(x)
 
-# FlashAttentionの計算量を計算する関数
-def calculate_computation_with_flash_attention(batch_size, h, seq_len_q, seq_len_k, d_k, tile_size_m, tile_size_n, tile_size_k):
-    """FlashAttentionの計算量を計算"""
-    # タイルの数を計算
-    num_tiles_m = np.ceil(seq_len_q / tile_size_m)
-    num_tiles_n = np.ceil(seq_len_k / tile_size_n)
-    num_tiles_k = np.ceil(d_k / tile_size_k)
+def parse_float_value(x):
+    if isinstance(x, str):
+        x = x.replace('(SingleTile)', '')
+        x = x.replace(',', '')
+        x = x.strip()
+        m = re.search(r'(\d+(\.\d+)?)', x)
+        if m:
+            return float(m.group(1))
+        else:
+            return 0.0
+    else:
+        return float(x)
 
-    # 1タイルあたりの計算量
-    computation_per_tile = (
-        2 * tile_size_m * tile_size_n * tile_size_k +  # QK^T
-        tile_size_m * tile_size_n +                    # Softmax
-        2 * tile_size_m * tile_size_n * tile_size_k    # AV
-    )
+def format_memory_size(bytes_val):
+    if bytes_val >= 1024**3:
+        return f"{bytes_val/(1024**3):.2f} GB"
+    elif bytes_val >= 1024**2:
+        return f"{bytes_val/(1024**2):.2f} MB"
+    elif bytes_val >= 1024:
+        return f"{bytes_val/1024:.2f} KB"
+    else:
+        return f"{bytes_val} B"
 
-    # 全タイルの合計計算量
-    total_computation = (
-        batch_size * h *
-        num_tiles_m * num_tiles_n * num_tiles_k *
-        computation_per_tile
-    )
-
-    return total_computation
-
-# タイルの実行回数とデータ再利用回数を計算する関数
-def calculate_tile_execution(m_len, n_len, k_len, tile_size_m, tile_size_n, tile_size_k):
-    """タイルの実行回数とデータ再利用回数を計算
-
-    Returns:
-        tuple: (total_tiles, avg_reuse)
-        - total_tiles: 実行する必要があるタイルの総数
-        - avg_reuse: 各データの平均再利用回数（整数）
-    """
-    # タイル分割数を計算
-    num_tiles_m = int(np.ceil(m_len / tile_size_m))
-    num_tiles_n = int(np.ceil(n_len / tile_size_n))
-    num_tiles_k = int(np.ceil(k_len / tile_size_k))
-
-    # 総タイル数
-    total_tiles = num_tiles_m * num_tiles_n * num_tiles_k
-
-    # データ再利用回数の計算
-    q_reuse = num_tiles_n * num_tiles_k
-    k_reuse = num_tiles_m * num_tiles_k
-    v_reuse = num_tiles_m * num_tiles_n
-
-    # 平均再利用回数を整数に丸める
-    avg_reuse = int(np.round((q_reuse + k_reuse + v_reuse) / 3))
-
-    return total_tiles, avg_reuse
-
-# グローバルに calculate_elements 関数を定義
-def calculate_elements(size_str):
-    # 正規表現で全てのタプルを抽出
-    tuples = re.findall(r'\(([^)]+)\)', size_str)
-    total_elements = 0
+def calculate_elements(shape_str):
+    tuples = re.findall(r'\(([^)]+)\)', shape_str)
+    total = 0
     for tup in tuples:
-        # 各要素を分割し、数値か変数かを判断
-        elements = tup.split(',')
+        parts = tup.split(',')
         product = 1
-        for elem in elements:
+        for elem in parts:
             elem = elem.strip()
             if elem.isdigit():
                 product *= int(elem)
             else:
-                # 変数名の場合、セッションステートから値を取得
-                value = st.session_state['params'].get(elem, 1)
-                product *= int(value)
-        total_elements += product
-    return total_elements
+                val = st.session_state['params'].get(elem, 1)
+                product *= int(val)
+        total += product
+    return total
 
-# 各モジュールの計算
-def calculate_module_details():
-    module_details = []
-    total_memory = 0
-    total_weight_memory = 0
-    total_bias_memory = 0
-    total_activation_memory = 0
-    total_kv_cache_memory = 0
-    total_computation_without_flash = 0
-    total_computation_with_flash = 0
+def flash_single_tile_comp(m, n, k):
+    return 2*m*n*k + (m*n) + 2*m*n*k
 
-    # メモリ使用量の計算のためのヘルパー関数
-    def calc_tensor_size(shape):
-        num_elements = np.prod(shape)
-        return num_elements * precision  # バイト数
+def flash_single_tile_params(d_model, tile_k):
+    return d_model * tile_k
 
-    # レイヤーノーマライゼーションのパラメータ数とメモリ
-    def layer_norm_params(size):
-        weight_size = size  # gamma
-        bias_size = size    # beta
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-        return weight_size, bias_size, weight_memory, bias_memory
+def flash_single_tile_qkv_data(m, n, k):
+    return (m*k) + (k*n) + (k*n)
 
-    # エンコーダ入力エンベッディング層
-    input_size = (batch_size, L_s)
-    output_size = (batch_size, L_s, d_model)
-    weight_size = V_src * d_model
-    bias_size = 0
-    weight_memory = weight_size * precision
-    bias_memory = bias_size * precision
-    activation_memory = calc_tensor_size(output_size)
-    total_weight_memory += weight_memory
-    total_bias_memory += bias_size
-    total_activation_memory += activation_memory
-    total_memory += weight_memory + bias_memory + activation_memory
+def flash_single_tile_kv_cache(m, n):
+    return (m*n)*2
 
-    encoder_embedding = {
-        'モジュール': 'エンコーダ入力エンベッディング',
-        '入力サイズ': f'{input_size}',
-        '出力サイズ': f'{output_size}',
-        '入力テンソル形状: バッチサイズ': batch_size,
-        '入力テンソル形状: シーケンス長': L_s,
-        '出力テンソル形状: バッチサイズ': batch_size,
-        '出力テンソル形状: シーケンス長': L_s,
-        '出力テンソル形状: 埋め込み次元': d_model,
-        '重みの数': f"{weight_size:,}",
-        'バイアスの数': f"{bias_size:,}",
-        '計算量': f"{0:,}",  # エンベディングはルックアップなので計算量は考慮しない
-        '重みメモリ': format_memory_size(weight_memory),
-        'バイアスメモリ': format_memory_size(bias_memory),
-        'アクティベーションメモリ': format_memory_size(activation_memory),
-        'KVキャッシュメモリ': format_memory_size(0),
-        '合計メモリ': format_memory_size(weight_memory + bias_memory + activation_memory),
-        'タイル実行回数': "N/A",
-        'データ再利用回数': "N/A"
+DEFAULT_PARAMS = {
+    "batch_size": 32,
+    "L_s": 50,
+    "L_t": 50,
+    "d_model": 512,
+    "N_enc": 6,
+    "N_dec": 6,
+    "h": 8,
+    "d_ff": 2048,
+    "V_src": 30000,
+    "V_tgt": 30000,
+    "dtype_str": "float32 (4bytes)",
+    "use_kv_cache": False,
+    "use_flash_attention": False,
+    "tile_size_m": 128,
+    "tile_size_n": 128,
+    "tile_size_k": 64
+}
+
+def save_parameters(params):
+    json_str = json.dumps(params, ensure_ascii=False, indent=4)
+    b64 = base64.b64encode(json_str.encode()).decode()
+    href = f'<a href="data:file/json;base64,{b64}" download="parameters.json">Download Params</a>'
+    st.sidebar.markdown(href, unsafe_allow_html=True)
+
+def load_parameters():
+    f = st.sidebar.file_uploader("Upload param file (.json)", type=["json"])
+    if f:
+        try:
+            data = f.read().decode()
+            pr = json.loads(data)
+            return pr
+        except Exception as e:
+            st.sidebar.error(f"Failed to load: {e}")
+    return None
+
+st.set_page_config(layout="wide")
+st.title("Transformer")
+st.write("")
+st.write("version: 1.5")
+
+st.sidebar.header("Model Params")
+if 'params' not in st.session_state:
+    st.session_state['params'] = DEFAULT_PARAMS.copy()
+
+if st.sidebar.button("Reset to Default"):
+    st.session_state['params'] = DEFAULT_PARAMS.copy()
+
+loaded = load_parameters()
+if loaded:
+    st.session_state['params'] = loaded
+    st.sidebar.success("Params loaded successfully")
+
+p = st.session_state['params']
+
+p["batch_size"] = st.sidebar.number_input("Batch Size", 1, 999999, value=p["batch_size"])
+p["L_s"] = st.sidebar.number_input("Source Seq (L_s)", 1, 999999, value=p["L_s"])
+p["L_t"] = st.sidebar.number_input("Target Seq (L_t)", 1, 999999, value=p["L_t"])
+p["d_model"] = st.sidebar.number_input("d_model", 1, 999999, value=p["d_model"])
+p["N_enc"] = st.sidebar.number_input("Encoder Layers (N_enc)", 1, 9999, value=p["N_enc"])
+p["N_dec"] = st.sidebar.number_input("Decoder Layers (N_dec)", 1, 9999, value=p["N_dec"])
+p["h"] = st.sidebar.number_input("Heads (h)", 1, 9999, value=p["h"])
+p["d_ff"] = st.sidebar.number_input("FeedForward Dim (d_ff)", 1, 999999, value=p["d_ff"])
+p["V_src"] = st.sidebar.number_input("V_src (Source Vocab)", 1, 999999, value=p["V_src"])
+p["V_tgt"] = st.sidebar.number_input("V_tgt (Target Vocab)", 1, 999999, value=p["V_tgt"])
+
+dtype_map = {
+    "float64 (8bytes)":8,
+    "float32 (4bytes)":4,
+    "float16 (2bytes)":2,
+    "int8 (1byte)":1
+}
+all_dtypes = list(dtype_map.keys())
+p["dtype_str"] = st.sidebar.selectbox("Data Type", all_dtypes, index=all_dtypes.index(p["dtype_str"]))
+
+p["use_kv_cache"] = st.sidebar.checkbox("Use KV Cache (per head)", value=p["use_kv_cache"])
+p["use_flash_attention"] = st.sidebar.checkbox("Use FlashAttention", value=p["use_flash_attention"])
+
+if p["use_flash_attention"]:
+    st.sidebar.subheader("FlashAttention Tile Sizes")
+    p["tile_size_m"] = st.sidebar.number_input("tile_size_m", 1, 9999, value=p["tile_size_m"])
+    p["tile_size_n"] = st.sidebar.number_input("tile_size_n", 1, 9999, value=p["tile_size_n"])
+    p["tile_size_k"] = st.sidebar.number_input("tile_size_k", 1, 9999, value=p["tile_size_k"])
+else:
+    p["tile_size_m"] = 128
+    p["tile_size_n"] = 128
+    p["tile_size_k"] = 64
+
+if st.sidebar.button("Save Params"):
+    save_parameters(p)
+
+st.session_state['params'] = p
+
+def mkrow(
+    name,
+    input_shape="",
+    output_shape="",
+    wnum=0,
+    bnum=0,
+    comp=0,
+    wmem=0,
+    bmem=0,
+    actmem=0,
+    kvcache=0,
+    qkv=0,
+    tile_ex=1,
+    reuse_c=1
+):
+    precision = dtype_map[p["dtype_str"]]
+    kv_elems = 0
+    if kvcache>0 and precision>0:
+        kv_elems = kvcache // precision
+    return {
+        "Module": name,
+        "Input Shape": str(input_shape),
+        "Output Shape": str(output_shape),
+        "Weights (#)": f"{wnum:,}" if wnum else "0",
+        "Biases (#)": f"{bnum:,}" if bnum else "0",
+        "Computations": f"{comp:,}" if comp else "0",
+        "Weight Memory": format_memory_size(wmem),
+        "Bias Memory": format_memory_size(bmem),
+        "Activation Memory": format_memory_size(actmem),
+        "KV Cache Memory": format_memory_size(kvcache),
+        "QKV Data (#)": f"{qkv}" if qkv else "0",
+        "KV Cache (#)": f"{kv_elems}" if kv_elems else "0",
+        "Total Memory": format_memory_size(wmem + bmem + actmem + kvcache),
+        "Tile Executions": tile_ex,
+        "Data Reuse Count": reuse_c
     }
-    module_details.append(encoder_embedding)
 
-    # エンコーダレイヤー
-    for layer in range(N_enc):
-        # レイヤーノーマライゼーション
-        ln_weight_size, ln_bias_size, ln_weight_memory, ln_bias_memory = layer_norm_params(d_model)
+def calc_details():
+    param = st.session_state['params']
+    batch_size = param["batch_size"]
+    L_s = param["L_s"]
+    L_t = param["L_t"]
+    d_model = param["d_model"]
+    N_enc = param["N_enc"]
+    N_dec = param["N_dec"]
+    h = param["h"]
+    d_ff = param["d_ff"]
+    V_src = param["V_src"]
+    V_tgt = param["V_tgt"]
+    precision = dtype_map[param["dtype_str"]]
+    use_kv = param["use_kv_cache"]
+    use_flash = param["use_flash_attention"]
+    tile_m = param["tile_size_m"]
+    tile_n = param["tile_size_n"]
+    tile_k = param["tile_size_k"]
 
-        # MHAのQ、K、Vの線形変換
-        module_name = f'エンコーダレイヤー{layer + 1} - MHA Linear Projections'
-        weight_size = d_model * d_model * 3
-        bias_size = d_model * 3
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
+    def ln_comp_enc():
+        return LN_FACTOR * batch_size * L_s * d_model
+    def ln_comp_dec():
+        return LN_FACTOR * batch_size * L_t * d_model
 
-        computation = batch_size * L_s * d_model * d_model * 3 * 2  # 2倍はforwardとbackward
+    rows = []
+    total_w_mem=0
+    total_b_mem=0
+    total_act_mem=0
+    total_kv_mem=0
+    total_mem=0
+    total_comp_no_flash=0
 
-        # アクティベーションメモリ
-        qkv_size = calc_tensor_size((batch_size, L_s, d_model * 3))
-
-        total_weight_memory += weight_memory + ln_weight_memory
-        total_bias_memory += bias_size + ln_bias_size
-        total_activation_memory += qkv_size
-        total_memory += weight_memory + bias_memory + qkv_size + ln_weight_memory + ln_bias_memory
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles, avg_reuse = calculate_tile_execution(
-            m_len=d_model,
-            n_len=d_ff,
-            k_len=d_model,
-            tile_size_m=tile_size_m if use_flash_attention else d_model,
-            tile_size_n=tile_size_n if use_flash_attention else d_ff,
-            tile_size_k=tile_size_k if use_flash_attention else d_model
+    w_enc_in = V_src*d_model
+    w_enc_in_mem = w_enc_in*precision
+    act_enc_in = batch_size*L_s*d_model*precision
+    total_w_mem += w_enc_in_mem
+    total_act_mem += act_enc_in
+    total_mem += (w_enc_in_mem + act_enc_in)
+    rows.append(
+        mkrow(
+            name="Encoder Input Embedding",
+            input_shape=f"({batch_size},{L_s})",
+            output_shape=f"({batch_size},{L_s},{d_model})",
+            wnum=w_enc_in,
+            wmem=w_enc_in_mem,
+            actmem=act_enc_in
         )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_s}, {d_model})',
-            '出力サイズ': f'QKV:({batch_size}, {L_s}, {d_model * 3})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model * 3,
-            '重みの数': f"{weight_size + ln_weight_size:,}",
-            'バイアスの数': f"{bias_size + ln_bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory + ln_weight_memory),
-            'バイアスメモリ': format_memory_size(bias_memory + ln_bias_memory),
-            'アクティベーションメモリ': format_memory_size(qkv_size),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_memory + qkv_size + ln_weight_memory + ln_bias_memory),
-            'タイル実行回数': total_tiles,
-            'データ再利用回数': avg_reuse
-        })
-
-        # スケールドドットプロダクトアテンションを細分化
-        # QK^T
-        module_name = f'エンコーダレイヤー{layer + 1} - Attention QK^T'
-        computation_qk = batch_size * h * L_s * L_s * (d_model // h) * 2
-        total_computation_without_flash += computation_qk
-        attn_scores_size = calc_tensor_size((batch_size, h, L_s, L_s))
-        total_activation_memory += attn_scores_size
-        total_memory += attn_scores_size
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_qk, avg_reuse_qk = calculate_tile_execution(
-            m_len=L_s,
-            n_len=L_s,
-            k_len=(d_model // h),
-            tile_size_m=tile_size_m if use_flash_attention else L_s,
-            tile_size_n=tile_size_n if use_flash_attention else L_s,
-            tile_size_k=tile_size_k if use_flash_attention else (d_model // h)
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Q:({batch_size}, {h}, {L_s}, d_k), K:({batch_size}, {h}, {L_s}, d_k)',
-            '出力サイズ': f'Scores:({batch_size}, {h}, {L_s}, {L_s})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': L_s,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_qk):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(attn_scores_size),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(attn_scores_size),
-            'タイル実行回数': total_tiles_qk,
-            'データ再利用回数': avg_reuse_qk
-        })
-
-        # スケーリング
-        module_name = f'エンコーダレイヤー{layer + 1} - Attention Scaling'
-        computation_scaling = batch_size * h * L_s * L_s
-        total_computation_without_flash += computation_scaling
-
-        # スケーリングはタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Scores:({batch_size}, {h}, {L_s}, {L_s})',
-            '出力サイズ': f'Scaled Scores:({batch_size}, {h}, {L_s}, {L_s})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': L_s,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_scaling):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(0),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-        # Softmax
-        module_name = f'エンコーダレイヤー{layer + 1} - Attention Softmax'
-        computation_softmax = batch_size * h * L_s * L_s * 5  # 近似的にSoftmaxの計算コストを乗算5回分とする
-        total_computation_without_flash += computation_softmax
-
-        # Softmaxもタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Scaled Scores:({batch_size}, {h}, {L_s}, {L_s})',
-            '出力サイズ': f'Attention Weights:({batch_size}, {h}, {L_s}, {L_s})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': L_s,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_softmax):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(0),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-        # SoftmaxとVの掛け算
-        module_name = f'エンコーダレイヤー{layer + 1} - Attention Softmax×V'
-        computation_av = batch_size * h * L_s * L_s * (d_model // h) * 2
-        total_computation_without_flash += computation_av
-        attn_output_size = calc_tensor_size((batch_size, L_s, d_model))
-        total_activation_memory += attn_output_size
-        total_memory += attn_output_size
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_av, avg_reuse_av = calculate_tile_execution(
-            m_len=L_s,
-            n_len=L_s,
-            k_len=(d_model // h),
-            tile_size_m=tile_size_m if use_flash_attention else L_s,
-            tile_size_n=tile_size_n if use_flash_attention else L_s,
-            tile_size_k=tile_size_k if use_flash_attention else (d_model // h)
-        )
-
-        # KVキャッシュメモリ
-        if use_kv_cache:
-            kv_cache_size = batch_size * L_s * d_model * 2  # KとV
-            kv_cache_memory = kv_cache_size * precision * N_enc  # エンコーダの全レイヤー分
-            if layer == 0:
-                total_kv_cache_memory = kv_cache_memory  # 合計に加算
-        else:
-            kv_cache_memory = 0
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Attention Weights:({batch_size}, {h}, {L_s}, {L_s}), V:({batch_size}, {h}, {L_s}, d_v)',
-            '出力サイズ': f'Context:({batch_size}, {L_s}, {d_model})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_av):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(attn_output_size),
-            'KVキャッシュメモリ': format_memory_size(kv_cache_memory) if layer == 0 else format_memory_size(0),
-            '合計メモリ': format_memory_size(attn_output_size + (kv_cache_memory if layer == 0 else 0)),
-            'タイル実行回数': total_tiles_av,
-            'データ再利用回数': avg_reuse_av
-        })
-
-        # MHAの最終線形層
-        module_name = f'エンコーダレイヤー{layer + 1} - MHA Output Linear'
-        weight_size = d_model * d_model
-        bias_size = d_model
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-
-        computation = batch_size * L_s * d_model * d_model * 2  # 2倍はforwardとbackward
-
-        total_weight_memory += weight_memory
-        total_bias_memory += bias_size
-        total_memory += weight_memory + bias_size * precision
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_output, avg_reuse_output = calculate_tile_execution(
-            m_len=d_model,
-            n_len=d_model,
-            k_len=d_model,
-            tile_size_m=tile_size_m if use_flash_attention else d_model,
-            tile_size_n=tile_size_n if use_flash_attention else d_model,
-            tile_size_k=tile_size_k if use_flash_attention else d_model
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_s}, {d_model})',
-            '出力サイズ': f'({batch_size}, {L_s}, {d_model})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{weight_size:,}",
-            'バイアスの数': f"{bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory),
-            'バイアスメモリ': format_memory_size(bias_memory),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_memory),
-            'タイル実行回数': total_tiles_output,
-            'データ再利用回数': avg_reuse_output
-        })
-
-        # スキップ接続とレイヤーノーマライゼーション
-        module_name = f'エンコーダレイヤー{layer + 1} - Skip Connection and LayerNorm'
-        ln_weight_size, ln_bias_size, ln_weight_memory, ln_bias_memory = layer_norm_params(d_model)
-
-        skip_connection_memory = calc_tensor_size((batch_size, L_s, d_model))
-
-        total_bias_memory += ln_bias_memory
-        total_weight_memory += ln_weight_memory
-        total_activation_memory += skip_connection_memory
-        total_memory += ln_weight_memory + ln_bias_memory + skip_connection_memory
-
-        # スキップ接続はタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'',
-            '出力サイズ': f'',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{ln_weight_size:,}",
-            'バイアスの数': f"{ln_bias_size:,}",
-            '計算量': f"{0}",
-            '重みメモリ': format_memory_size(ln_weight_memory),
-            'バイアスメモリ': format_memory_size(ln_bias_memory),
-            'アクティベーションメモリ': format_memory_size(skip_connection_memory),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(ln_weight_memory + ln_bias_memory + skip_connection_memory),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-        # FFNの最初の線形層と活性化関数
-        module_name = f'エンコーダレイヤー{layer + 1} - FFN Layer 1 + Activation'
-        weight_size = d_model * d_ff
-        bias_size = d_ff
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-
-        computation = batch_size * L_s * d_model * d_ff * 2  # 2倍はforwardとbackward
-
-        hidden_layer_size = calc_tensor_size((batch_size, L_s, d_ff))
-
-        total_weight_memory += weight_memory
-        total_bias_memory += bias_size
-        total_activation_memory += hidden_layer_size
-        total_memory += weight_memory + bias_size * precision + hidden_layer_size
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_ffn1, avg_reuse_ffn1 = calculate_tile_execution(
-            m_len=d_model,
-            n_len=d_ff,
-            k_len=d_model,
-            tile_size_m=tile_size_m if use_flash_attention else d_model,
-            tile_size_n=tile_size_n if use_flash_attention else d_ff,
-            tile_size_k=tile_size_k if use_flash_attention else d_model
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_s}, {d_model})',
-            '出力サイズ': f'({batch_size}, {L_s}, {d_ff})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '重みの数': f"{weight_size:,}",
-            'バイアスの数': f"{bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory),
-            'バイアスメモリ': format_memory_size(bias_size * precision),
-            'アクティベーションメモリ': format_memory_size(hidden_layer_size),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_size * precision + hidden_layer_size),
-            'タイル実行回数': total_tiles_ffn1,
-            'データ再利用回数': avg_reuse_ffn1
-        })
-
-        # FFNの2番目の線形層
-        module_name = f'エンコーダレイヤー{layer + 1} - FFN Layer 2'
-        weight_size = d_ff * d_model
-        bias_size = d_model
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-
-        computation = batch_size * L_s * d_ff * d_model * 2  # 2倍はforwardとbackward
-
-        total_weight_memory += weight_size * precision
-        total_bias_memory += bias_size * precision
-        total_memory += weight_memory + bias_size * precision
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_ffn2, avg_reuse_ffn2 = calculate_tile_execution(
-            m_len=d_ff,
-            n_len=d_model,
-            k_len=d_ff,
-            tile_size_m=tile_size_m if use_flash_attention else d_ff,
-            tile_size_n=tile_size_n if use_flash_attention else d_model,
-            tile_size_k=tile_size_k if use_flash_attention else d_ff
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_s}, {d_ff})',
-            '出力サイズ': f'({batch_size}, {L_s}, {d_model})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{weight_size:,}",
-            'バイアスの数': f"{bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory),
-            'バイアスメモリ': format_memory_size(bias_size * precision),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_size * precision),
-            'タイル実行回数': total_tiles_ffn2,
-            'データ再利用回数': avg_reuse_ffn2
-        })
-
-        # スキップ接続とレイヤーノーマライゼーション（FFN後）
-        module_name = f'エンコーダレイヤー{layer + 1} - FFN Skip Connection and LayerNorm'
-        ln_weight_size, ln_bias_size, ln_weight_memory, ln_bias_memory = layer_norm_params(d_model)
-
-        skip_connection_memory = calc_tensor_size((batch_size, L_s, d_model))
-
-        total_bias_memory += ln_bias_memory
-        total_weight_memory += ln_weight_memory
-        total_activation_memory += skip_connection_memory
-        total_memory += ln_weight_memory + ln_bias_memory + skip_connection_memory
-
-        # スキップ接続はタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'',
-            '出力サイズ': f'',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_s,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_s,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{ln_weight_size:,}",
-            'バイアスの数': f"{ln_bias_size:,}",
-            '計算量': f"{0}",
-            '重みメモリ': format_memory_size(ln_weight_memory),
-            'バイアスメモリ': format_memory_size(ln_bias_memory),
-            'アクティベーションメモリ': format_memory_size(skip_connection_memory),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(ln_weight_memory + ln_bias_memory + skip_connection_memory),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-    # デコーダ入力エンベッディング層
-    input_size = (batch_size, L_t)
-    output_size = (batch_size, L_t, d_model)
-    weight_size = V_tgt * d_model
-    bias_size = 0
-    weight_memory = weight_size * precision
-    bias_memory = bias_size * precision
-    activation_memory = calc_tensor_size(output_size)
-    total_weight_memory += weight_memory
-    total_bias_memory += bias_size
-    total_activation_memory += activation_memory
-    total_memory += weight_memory + bias_size * precision + activation_memory
-
-    decoder_embedding = {
-        'モジュール': 'デコーダ入力エンベッディング',
-        '入力サイズ': f'{input_size}',
-        '出力サイズ': f'{output_size}',
-        '入力テンソル形状: バッチサイズ': batch_size,
-        '入力テンソル形状: シーケンス長': L_t,
-        '出力テンソル形状: バッチサイズ': batch_size,
-        '出力テンソル形状: シーケンス長': L_t,
-        '出力テンソル形状: 埋め込み次元': d_model,
-        '重みの数': f"{weight_size:,}",
-        'バイアスの数': f"{bias_size:,}",
-        '計算量': f"{0:,}",
-        '重みメモリ': format_memory_size(weight_memory),
-        'バイアスメモリ': format_memory_size(bias_memory),
-        'アクティベーションメモリ': format_memory_size(activation_memory),
-        'KVキャッシュメモリ': format_memory_size(0),
-        '合計メモリ': format_memory_size(weight_memory + bias_memory + activation_memory),
-        'タイル実行回数': "N/A",
-        'データ再利用回数': "N/A"
-    }
-    module_details.append(decoder_embedding)
-
-    # デコーダレイヤー
-    for layer in range(N_dec):
-        # レイヤーノーマライゼーション
-        ln_weight_size, ln_bias_size, ln_weight_memory, ln_bias_memory = layer_norm_params(d_model)
-
-        # マスクドMHAのQ、K、Vの線形変換
-        module_name = f'Decoder Layer {layer + 1} - Masked MHA Linear Projections'
-        weight_size = d_model * d_model * 3
-        bias_size = d_model * 3
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-
-        computation = batch_size * L_t * d_model * d_model * 3 * 2
-
-        qkv_size = calc_tensor_size((batch_size, L_t, d_model * 3))
-
-        total_weight_memory += weight_memory + ln_weight_memory
-        total_bias_memory += bias_size + ln_bias_size
-        total_activation_memory += qkv_size
-        total_memory += weight_memory + bias_memory + qkv_size + ln_weight_memory + ln_bias_memory
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_qkv, avg_reuse_qkv = calculate_tile_execution(
-            m_len=d_model,
-            n_len=d_model,
-            k_len=d_model,
-            tile_size_m=tile_size_m if use_flash_attention else d_model,
-            tile_size_n=tile_size_n if use_flash_attention else d_model,
-            tile_size_k=tile_size_k if use_flash_attention else d_model
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_t}, {d_model})',
-            '出力サイズ': f'QKV:({batch_size}, {L_t}, {d_model * 3})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_t,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_t,
-            '出力テンソル形状: 埋め込み次元': d_model * 3,
-            '重みの数': f"{weight_size + ln_weight_size:,}",
-            'バイアスの数': f"{bias_size + ln_bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory + ln_weight_memory),
-            'バイアスメモリ': format_memory_size(bias_memory + ln_bias_memory),
-            'アクティベーションメモリ': format_memory_size(qkv_size),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_memory + qkv_size + ln_weight_memory + ln_bias_memory),
-            'タイル実行回数': total_tiles_qkv,
-            'データ再利用回数': avg_reuse_qkv
-        })
-
-        # マスクドスケールドドットプロダクトアテンションを細分化
-        # QK^T
-        module_name = f'Decoder Layer {layer + 1} - Masked Attention QK^T'
-        if use_kv_cache:
-            seq_len_q = 1
-            seq_len_k = L_t
-        else:
-            seq_len_q = L_t
-            seq_len_k = L_t
-
-        computation_qk = batch_size * h * seq_len_q * seq_len_k * (d_model // h) * 2
-        total_computation_without_flash += computation_qk
-        attn_scores_size = calc_tensor_size((batch_size, h, seq_len_q, seq_len_k))
-        total_activation_memory += attn_scores_size
-        total_memory += attn_scores_size
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_qk_dec, avg_reuse_qk_dec = calculate_tile_execution(
-            m_len=seq_len_q,
-            n_len=seq_len_k,
-            k_len=(d_model // h),
-            tile_size_m=tile_size_m if use_flash_attention else seq_len_q,
-            tile_size_n=tile_size_n if use_flash_attention else seq_len_k,
-            tile_size_k=tile_size_k if use_flash_attention else (d_model // h)
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Q:({batch_size}, {h}, {seq_len_q}, d_k), K:({batch_size}, {h}, {seq_len_k}, d_k)',
-            '出力サイズ': f'Scores:({batch_size}, {h}, {seq_len_q}, {seq_len_k})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': seq_len_q,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': seq_len_q,
-            '出力テンソル形状: 埋め込み次元': seq_len_k,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_qk):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(attn_scores_size),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(attn_scores_size),
-            'タイル実行回数': total_tiles_qk_dec,
-            'データ再利用回数': avg_reuse_qk_dec
-        })
-
-        # スケーリング
-        module_name = f'Decoder Layer {layer + 1} - Masked Attention Scaling'
-        computation_scaling = batch_size * h * seq_len_q * seq_len_k
-        total_computation_without_flash += computation_scaling
-
-        # スケーリングはタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Scores:({batch_size}, {h}, {seq_len_q}, {seq_len_k})',
-            '出力サイズ': f'Scaled Scores:({batch_size}, {h}, {seq_len_q}, {seq_len_k})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': seq_len_q,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': seq_len_q,
-            '出力テンソル形状: 埋め込み次元': seq_len_k,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_scaling):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(0),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-        # Softmax
-        module_name = f'Decoder Layer {layer + 1} - Masked Attention Softmax'
-        computation_softmax = batch_size * h * seq_len_q * seq_len_k * 5  # 近似的にSoftmaxの計算コストを乗算5回分とする
-        total_computation_without_flash += computation_softmax
-
-        # Softmaxもタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Scaled Scores:({batch_size}, {h}, {seq_len_q}, {seq_len_k})',
-            '出力サイズ': f'Attention Weights:({batch_size}, {h}, {seq_len_q}, {seq_len_k})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': seq_len_q,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': seq_len_q,
-            '出力テンソル形状: 埋め込み次元': seq_len_k,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_softmax):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(0),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-        # SoftmaxとVの掛け算
-        module_name = f'Decoder Layer {layer + 1} - Masked Attention Softmax×V'
-        computation_av = batch_size * h * seq_len_q * seq_len_k * (d_model // h) * 2
-        total_computation_without_flash += computation_av
-        attn_output_size = calc_tensor_size((batch_size, L_t, d_model))
-        total_activation_memory += attn_output_size
-        total_memory += attn_output_size
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_av_dec, avg_reuse_av_dec = calculate_tile_execution(
-            m_len=L_t,
-            n_len=L_t,
-            k_len=(d_model // h),
-            tile_size_m=tile_size_m if use_flash_attention else L_t,
-            tile_size_n=tile_size_n if use_flash_attention else L_t,
-            tile_size_k=tile_size_k if use_flash_attention else (d_model // h)
-        )
-
-        # KVキャッシュメモリ
-        if use_kv_cache:
-            kv_cache_size = batch_size * seq_len_k * d_model * 2  # KとV
-            kv_cache_memory = kv_cache_size * precision * N_dec  # デコーダの全レイヤー分
-            if layer == 0:
-                total_kv_cache_memory = kv_cache_memory  # 合計に加算
-        else:
-            kv_cache_memory = 0
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'Attention Weights:({batch_size}, {h}, {seq_len_q}, {seq_len_k}), V:({batch_size}, {h}, {seq_len_k}, d_v)',
-            '出力サイズ': f'Context:({batch_size}, {L_t}, {d_model})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': seq_len_q,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_t,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"0",
-            'バイアスの数': f"0",
-            '計算量': f"{int(computation_av):,}",
-            '重みメモリ': format_memory_size(0),
-            'バイアスメモリ': format_memory_size(0),
-            'アクティベーションメモリ': format_memory_size(attn_output_size),
-            'KVキャッシュメモリ': format_memory_size(kv_cache_memory) if layer == 0 else format_memory_size(0),
-            '合計メモリ': format_memory_size(attn_output_size + (kv_cache_memory if layer == 0 else 0)),
-            'タイル実行回数': total_tiles_av_dec,
-            'データ再利用回数': avg_reuse_av_dec
-        })
-
-        # MHAの最終線形層
-        module_name = f'Decoder Layer {layer + 1} - Masked MHA Output Linear'
-        weight_size = d_model * d_model
-        bias_size = d_model
-        weight_memory = weight_size * precision
-        bias_memory = bias_size * precision
-
-        computation = batch_size * L_t * d_model * d_model * 2
-
-        total_weight_memory += weight_memory
-        total_bias_memory += bias_size
-        total_memory += weight_memory + bias_size * precision
-
-        total_computation_without_flash += computation
-
-        # タイル実行回数とデータ再利用回数の計算
-        total_tiles_output_dec, avg_reuse_output_dec = calculate_tile_execution(
-            m_len=d_model,
-            n_len=d_model,
-            k_len=d_model,
-            tile_size_m=tile_size_m if use_flash_attention else d_model,
-            tile_size_n=tile_size_n if use_flash_attention else d_model,
-            tile_size_k=tile_size_k if use_flash_attention else d_model
-        )
-
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'({batch_size}, {L_t}, {d_model})',
-            '出力サイズ': f'({batch_size}, {L_t}, {d_model})',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_t,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_t,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{weight_size:,}",
-            'バイアスの数': f"{bias_size:,}",
-            '計算量': f"{int(computation):,}",
-            '重みメモリ': format_memory_size(weight_memory),
-            'バイアスメモリ': format_memory_size(bias_memory),
-            'アクティベーションメモリ': format_memory_size(0),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(weight_memory + bias_memory),
-            'タイル実行回数': total_tiles_output_dec,
-            'データ再利用回数': avg_reuse_output_dec
-        })
-
-        # スキップ接続とレイヤーノーマライゼーション（Encoder-Decoder Attention後）
-        module_name = f'Decoder Layer {layer + 1} - Skip Connection and LayerNorm (After Encoder-Decoder Attention)'
-        ln_weight_size, ln_bias_size, ln_weight_memory, ln_bias_memory = layer_norm_params(d_model)
-
-        skip_connection_memory = calc_tensor_size((batch_size, L_t, d_model))
-
-        total_bias_memory += ln_bias_memory
-        total_weight_memory += ln_weight_memory
-        total_activation_memory += skip_connection_memory
-        total_memory += ln_weight_memory + ln_bias_memory + skip_connection_memory
-
-        # スキップ接続はタイル処理が不要なため、"N/A"とします
-        module_details.append({
-            'モジュール': module_name,
-            '入力サイズ': f'',
-            '出力サイズ': f'',
-            '入力テンソル形状: バッチサイズ': batch_size,
-            '入力テンソル形状: シーケンス長': L_t,
-            '入力テンソル形状: 埋め込み次元': d_model,
-            '出力テンソル形状: バッチサイズ': batch_size,
-            '出力テンソル形状: シーケンス長': L_t,
-            '出力テンソル形状: 埋め込み次元': d_model,
-            '重みの数': f"{ln_weight_size:,}",
-            'バイアスの数': f"{ln_bias_size:,}",
-            '計算量': f"{0}",
-            '重みメモリ': format_memory_size(ln_weight_memory),
-            'バイアスメモリ': format_memory_size(ln_bias_memory),
-            'アクティベーションメモリ': format_memory_size(skip_connection_memory),
-            'KVキャッシュメモリ': format_memory_size(0),
-            '合計メモリ': format_memory_size(ln_weight_memory + ln_bias_memory + skip_connection_memory),
-            'タイル実行回数': "N/A",
-            'データ再利用回数': "N/A"
-        })
-
-    # 出力線形変換層
-    input_size = (batch_size, L_t, d_model)
-    output_size = (batch_size, L_t, V_tgt)
-    weight_size = d_model * V_tgt
-    bias_size = V_tgt
-    computation = batch_size * L_t * d_model * V_tgt * 2  # 2倍はforwardとbackward
-    weight_memory = weight_size * precision
-    bias_memory = bias_size * precision
-    activation_memory = calc_tensor_size(output_size)
-    total_weight_memory += weight_memory
-    total_bias_memory += bias_size * precision
-    total_activation_memory += activation_memory
-    total_memory += weight_memory + bias_size * precision + activation_memory
-
-    total_computation_without_flash += computation
-
-    # タイル実行回数とデータ再利用回数の計算
-    total_tiles_out, avg_reuse_out = calculate_tile_execution(
-        m_len=d_model,
-        n_len=V_tgt,
-        k_len=d_model,
-        tile_size_m=tile_size_m if use_flash_attention else d_model,
-        tile_size_n=tile_size_n if use_flash_attention else V_tgt,
-        tile_size_k=tile_size_k if use_flash_attention else d_model
     )
 
-    output_linear = {
-        'モジュール': '出力線形変換',
-        '入力サイズ': f'{input_size}',
-        '出力サイズ': f'{output_size}',
-        '入力テンソル形状: バッチサイズ': batch_size,
-        '入力テンソル形状: シーケンス長': L_t,
-        '入力テンソル形状: 埋め込み次元': d_model,
-        '出力テンソル形状: バッチサイズ': batch_size,
-        '出力テンソル形状: シーケンス長': L_t,
-        '重みの数': f"{weight_size:,}",
-        'バイアスの数': f"{bias_size:,}",
-        '計算量': f"{int(computation):,}",
-        '重みメモリ': format_memory_size(weight_memory),
-        'バイアスメモリ': format_memory_size(bias_size * precision),
-        'アクティベーションメモリ': format_memory_size(activation_memory),
-        'KVキャッシュメモリ': format_memory_size(0),
-        '合計メモリ': format_memory_size(weight_memory + bias_size * precision + activation_memory),
-        'タイル実行回数': total_tiles_out,
-        'データ再利用回数': avg_reuse_out
-    }
-    module_details.append(output_linear)
+    for i in range(N_enc):
+        layer_idx = i+1
+        ln_w = d_model
+        ln_b = d_model
+        ln_wmem = ln_w*precision
+        ln_bmem = ln_b*precision
+        ln_act = batch_size*L_s*d_model*precision
+        comp_ln = ln_comp_enc()
+        total_comp_no_flash += comp_ln
+        total_w_mem += ln_wmem
+        total_b_mem += ln_b
+        total_act_mem += ln_act
+        total_mem += (ln_wmem + ln_bmem + ln_act)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - MHA LayerNorm",
+                wnum=ln_w,bnum=ln_b,comp=comp_ln,
+                wmem=ln_wmem,bmem=ln_bmem,actmem=ln_act
+            )
+        )
 
-    return (module_details, total_memory, total_weight_memory, total_bias_memory,
-            total_activation_memory, total_kv_cache_memory,
-            total_computation_without_flash, total_computation_with_flash)
+        w_mha = d_model*d_model*3
+        b_mha = d_model*3
+        w_mha_mem = w_mha*precision
+        b_mha_mem = b_mha*precision
+        comp_mha = batch_size*L_s*d_model*d_model*3*2
+        qkv_count = batch_size*L_s*d_model*3
+        qkv_mem = qkv_count*precision
+        total_comp_no_flash += comp_mha
+        total_w_mem += w_mha_mem
+        total_b_mem += b_mha
+        total_act_mem += qkv_mem
+        total_mem += (w_mha_mem + b_mha_mem + qkv_mem)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - MHA Linear Projections",
+                input_shape=f"({batch_size},{L_s},{d_model})",
+                output_shape=f"QKV:({batch_size},{L_s},{3*d_model})",
+                wnum=w_mha,bnum=b_mha,comp=comp_mha,
+                wmem=w_mha_mem,bmem=b_mha_mem,actmem=qkv_mem,
+                qkv=qkv_count
+            )
+        )
 
-# 計算結果を取得
-(module_details, total_memory, total_weight_memory, total_bias_memory,
- total_activation_memory, total_kv_cache_memory,
- total_computation_without_flash, total_computation_with_flash) = calculate_module_details()
+        comp_qk = batch_size*h*L_s*L_s*(d_model//h)*2
+        attn_score_mem = (comp_qk//2)*precision
+        total_comp_no_flash += comp_qk
+        total_act_mem += attn_score_mem
+        total_mem += attn_score_mem
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - Attention QK^T",
+                comp=comp_qk,
+                actmem=attn_score_mem
+            )
+        )
 
-# データフレームに変換
-df = pd.DataFrame(module_details)
+        comp_scale = batch_size*h*L_s*L_s
+        total_comp_no_flash += comp_scale
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - Attention Scaling",
+                comp=comp_scale
+            )
+        )
 
-# モジュールタイプの追加
-def get_module_type(module_name):
-    if 'エンコーダ' in module_name or 'Encoder' in module_name:
-        return 'エンコーダ'
-    elif 'デコーダ' in module_name or 'Decoder' in module_name:
-        return 'デコーダ'
+        comp_soft = batch_size*h*L_s*L_s*5
+        total_comp_no_flash += comp_soft
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - Attention Softmax",
+                comp=comp_soft
+            )
+        )
+
+        comp_av = batch_size*h*L_s*L_s*(d_model//h)*2
+        av_ct = batch_size*L_s*d_model
+        av_mem = av_ct*precision
+        total_comp_no_flash += comp_av
+        total_act_mem += av_mem
+        total_mem += av_mem
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - Attention Softmax×V",
+                comp=comp_av,
+                output_shape=f"Context:({batch_size},{L_s},{d_model})",
+                actmem=av_mem
+            )
+        )
+
+        w_out = d_model*d_model
+        b_out = d_model
+        w_out_mem = w_out*precision
+        b_out_mem = b_out*precision
+        comp_out = batch_size*L_s*d_model*d_model*2
+        total_comp_no_flash += comp_out
+        total_w_mem += w_out_mem
+        total_b_mem += b_out
+        total_mem += (w_out_mem + b_out_mem)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - MHA Output Linear",
+                input_shape=f"({batch_size},{L_s},{d_model})",
+                output_shape=f"({batch_size},{L_s},{d_model})",
+                wnum=w_out,bnum=b_out,comp=comp_out,
+                wmem=w_out_mem,bmem=b_out_mem
+            )
+        )
+
+        skip_mem = batch_size*L_s*d_model*precision
+        total_act_mem += skip_mem
+        total_mem += skip_mem
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - Skip Connection",
+                actmem=skip_mem
+            )
+        )
+
+        ln_w2 = d_model
+        ln_b2 = d_model
+        ln_w2_mem = ln_w2*precision
+        ln_b2_mem = ln_b2*precision
+        ln_act2 = batch_size*L_s*d_model*precision
+        comp_ln2 = LN_FACTOR*batch_size*L_s*d_model
+        total_comp_no_flash += comp_ln2
+        total_w_mem += ln_w2_mem
+        total_b_mem += ln_b2
+        total_act_mem += ln_act2
+        total_mem += (ln_w2_mem + ln_b2_mem + ln_act2)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - MHA LayerNorm (Post)",
+                wnum=ln_w2,bnum=ln_b2,comp=comp_ln2,
+                wmem=ln_w2_mem,bmem=ln_b2_mem,actmem=ln_act2
+            )
+        )
+
+        w_ffn1 = d_model*d_ff
+        b_ffn1 = d_ff
+        w_ffn1_mem = w_ffn1*precision
+        b_ffn1_mem = b_ffn1*precision
+        comp_ffn1 = batch_size*L_s*d_model*d_ff*2
+        ffn1_mem = batch_size*L_s*d_ff*precision
+        total_comp_no_flash += comp_ffn1
+        total_w_mem += w_ffn1_mem
+        total_b_mem += b_ffn1
+        total_act_mem += ffn1_mem
+        total_mem += (w_ffn1_mem + b_ffn1_mem + ffn1_mem)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - FFN Layer 1 + Activation",
+                input_shape=f"({batch_size},{L_s},{d_model})",
+                output_shape=f"({batch_size},{L_s},{d_ff})",
+                wnum=w_ffn1,bnum=b_ffn1,comp=comp_ffn1,
+                wmem=w_ffn1_mem,bmem=b_ffn1_mem,actmem=ffn1_mem
+            )
+        )
+
+        w_ffn2 = d_ff*d_model
+        b_ffn2 = d_model
+        w_ffn2_mem = w_ffn2*precision
+        b_ffn2_mem = b_ffn2*precision
+        comp_ffn2 = batch_size*L_s*d_ff*d_model*2
+        total_comp_no_flash += comp_ffn2
+        total_w_mem += w_ffn2_mem
+        total_b_mem += b_ffn2
+        total_mem += (w_ffn2_mem + b_ffn2_mem)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - FFN Layer 2",
+                input_shape=f"({batch_size},{L_s},{d_ff})",
+                output_shape=f"({batch_size},{L_s},{d_model})",
+                wnum=w_ffn2,bnum=b_ffn2,comp=comp_ffn2,
+                wmem=w_ffn2_mem,bmem=b_ffn2_mem
+            )
+        )
+
+        skip_ffn = batch_size*L_s*d_model*precision
+        total_act_mem += skip_ffn
+        total_mem += skip_ffn
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - FFN Skip Connection",
+                actmem=skip_ffn
+            )
+        )
+
+        ln_w3 = d_model
+        ln_b3 = d_model
+        ln_w3_mem = ln_w3*precision
+        ln_b3_mem = ln_b3*precision
+        ln_act3 = batch_size*L_s*d_model*precision
+        comp_ln3 = LN_FACTOR*batch_size*L_s*d_model
+        total_comp_no_flash += comp_ln3
+        total_w_mem += ln_w3_mem
+        total_b_mem += ln_b3
+        total_act_mem += ln_act3
+        total_mem += (ln_w3_mem + ln_b3_mem + ln_act3)
+        rows.append(
+            mkrow(
+                name=f"Encoder Layer {layer_idx} - FFN LayerNorm",
+                wnum=ln_w3,bnum=ln_b3,comp=comp_ln3,
+                wmem=ln_w3_mem,bmem=ln_b3_mem,actmem=ln_act3
+            )
+        )
+
+    w_dec_in = V_tgt*d_model
+    w_dec_in_mem = w_dec_in*precision
+    dec_in_act = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+    total_w_mem += w_dec_in_mem
+    total_act_mem += dec_in_act
+    total_mem += (w_dec_in_mem + dec_in_act)
+    rows.append(
+        mkrow(
+            name="Decoder Input Embedding",
+            input_shape=f"({p['batch_size']},{p['L_t']})",
+            output_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+            wnum=w_dec_in,
+            bnum=0,
+            wmem=w_dec_in_mem,
+            bmem=0,
+            actmem=dec_in_act
+        )
+    )
+
+    def ln_comp_dec():
+        return LN_FACTOR*p["batch_size"]*p["L_t"]*p["d_model"]
+
+    for dec_i in range(p["N_dec"]):
+        layer_name = dec_i+1
+        ln_w4 = p["d_model"]
+        ln_b4 = p["d_model"]
+        ln_w4_mem = ln_w4*precision
+        ln_b4_mem = ln_b4*precision
+        ln_act4 = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+        comp_ln4 = ln_comp_dec()
+        total_comp_no_flash += comp_ln4
+        total_w_mem += ln_w4_mem
+        total_b_mem += ln_b4
+        total_act_mem += ln_act4
+        total_mem += (ln_w4_mem+ln_b4_mem+ln_act4)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked MHA LayerNorm",
+                wnum=ln_w4,bnum=ln_b4,comp=comp_ln4,
+                wmem=ln_w4_mem,bmem=ln_b4_mem,actmem=ln_act4
+            )
+        )
+
+        w_mha_dec = p["d_model"]*p["d_model"]*3
+        b_mha_dec = p["d_model"]*3
+        w_mha_dec_mem = w_mha_dec*precision
+        b_mha_dec_mem = b_mha_dec*precision
+        comp_mha_dec = p["batch_size"]*p["L_t"]*p["d_model"]*p["d_model"]*3*2
+        qkv_ct_dec = p["batch_size"]*p["L_t"]*p["d_model"]*3
+        qkv_mem_dec = qkv_ct_dec*precision
+        total_comp_no_flash += comp_mha_dec
+        total_w_mem += w_mha_dec_mem
+        total_b_mem += b_mha_dec
+        total_act_mem += qkv_mem_dec
+        total_mem += (w_mha_dec_mem + b_mha_dec_mem + qkv_mem_dec)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked MHA Linear Projections",
+                input_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+                output_shape=f"QKV:({p['batch_size']},{p['L_t']},{3*p['d_model']})",
+                wnum=w_mha_dec,bnum=b_mha_dec,
+                comp=comp_mha_dec,
+                wmem=w_mha_dec_mem,bmem=b_mha_dec_mem,
+                actmem=qkv_mem_dec,
+                qkv=qkv_ct_dec
+            )
+        )
+
+        comp_qk_dec = p["batch_size"]*p["h"]*p["L_t"]*p["L_t"]*((p["d_model"]//p["h"]))*2
+        qk_dec_mem = (comp_qk_dec//2)*precision
+        total_comp_no_flash += comp_qk_dec
+        total_act_mem += qk_dec_mem
+        total_mem += qk_dec_mem
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked Attention QK^T",
+                comp=comp_qk_dec,
+                actmem=qk_dec_mem
+            )
+        )
+
+        comp_scale_dec = p["batch_size"]*p["h"]*p["L_t"]*p["L_t"]
+        total_comp_no_flash += comp_scale_dec
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked Attention Scaling",
+                comp=comp_scale_dec
+            )
+        )
+
+        comp_soft_dec = p["batch_size"]*p["h"]*p["L_t"]*p["L_t"]*5
+        total_comp_no_flash += comp_soft_dec
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked Attention Softmax",
+                comp=comp_soft_dec
+            )
+        )
+
+        comp_av_dec = p["batch_size"]*p["h"]*p["L_t"]*p["L_t"]*((p["d_model"]//p["h"]))*2
+        av_dec_ct = p["batch_size"]*p["L_t"]*p["d_model"]
+        av_dec_mem = av_dec_ct*precision
+        total_comp_no_flash += comp_av_dec
+        total_act_mem += av_dec_mem
+        total_mem += av_dec_mem
+
+        kv_bytes = 0
+        if p["use_kv_cache"] and dec_i==0:
+            d_k = p["d_model"]//p["h"]
+            if d_k>0:
+                kv_count_per_layer = p["batch_size"]*p["h"]*p["L_t"]*d_k*2
+                kv_count_all = kv_count_per_layer*p["N_dec"]
+                kv_bytes = kv_count_all*precision
+                total_mem += kv_bytes
+
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked Attention Softmax×V",
+                comp=comp_av_dec,
+                output_shape=f"Context:({p['batch_size']},{p['L_t']},{p['d_model']})",
+                actmem=av_dec_mem,
+                kvcache=kv_bytes
+            )
+        )
+
+        w_out_dec = p["d_model"]*p["d_model"]
+        b_out_dec = p["d_model"]
+        w_out_dec_mem = w_out_dec*precision
+        b_out_dec_mem = b_out_dec*precision
+        comp_out_dec = p["batch_size"]*p["L_t"]*p["d_model"]*p["d_model"]*2
+        total_comp_no_flash += comp_out_dec
+        total_w_mem += w_out_dec_mem
+        total_b_mem += b_out_dec
+        total_mem += (w_out_dec_mem + b_out_dec_mem)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Masked MHA Output Linear",
+                input_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+                output_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+                wnum=w_out_dec,bnum=b_out_dec,
+                comp=comp_out_dec,
+                wmem=w_out_dec_mem,bmem=b_out_dec_mem
+            )
+        )
+
+        skip_mha = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+        total_act_mem += skip_mha
+        total_mem += skip_mha
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Skip Connection (MHA)",
+                actmem=skip_mha
+            )
+        )
+
+        ln_w5 = p["d_model"]
+        ln_b5 = p["d_model"]
+        ln_w5_mem = ln_w5*precision
+        ln_b5_mem = ln_b5*precision
+        ln_act5 = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+        comp_ln5 = ln_comp_dec()
+        total_comp_no_flash += comp_ln5
+        total_w_mem += ln_w5_mem
+        total_b_mem += ln_b5
+        total_act_mem += ln_act5
+        total_mem += (ln_w5_mem + ln_b5_mem + ln_act5)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - MHA LayerNorm (Post)",
+                wnum=ln_w5,bnum=ln_b5,comp=comp_ln5,
+                wmem=ln_w5_mem,bmem=ln_b5_mem,actmem=ln_act5
+            )
+        )
+
+        w_ffn1d = p["d_model"]*p["d_ff"]
+        b_ffn1d = p["d_ff"]
+        w_ffn1d_mem = w_ffn1d*precision
+        b_ffn1d_mem = b_ffn1d*precision
+        comp_ffn1d = p["batch_size"]*p["L_t"]*p["d_model"]*p["d_ff"]*2
+        ffn1d_act = p["batch_size"]*p["L_t"]*p["d_ff"]*precision
+        total_comp_no_flash += comp_ffn1d
+        total_w_mem += w_ffn1d_mem
+        total_b_mem += b_ffn1d
+        total_act_mem += ffn1d_act
+        total_mem += (w_ffn1d_mem + b_ffn1d_mem + ffn1d_act)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - FFN Layer 1 + Activation",
+                input_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+                output_shape=f"({p['batch_size']},{p['L_t']},{p['d_ff']})",
+                wnum=w_ffn1d,bnum=b_ffn1d,comp=comp_ffn1d,
+                wmem=w_ffn1d_mem,bmem=b_ffn1d_mem,actmem=ffn1d_act
+            )
+        )
+
+        w_ffn2d = p["d_ff"]*p["d_model"]
+        b_ffn2d = p["d_model"]
+        w_ffn2d_mem = w_ffn2d*precision
+        b_ffn2d_mem = b_ffn2d*precision
+        comp_ffn2d = p["batch_size"]*p["L_t"]*p["d_ff"]*p["d_model"]*2
+        total_comp_no_flash += comp_ffn2d
+        total_w_mem += w_ffn2d_mem
+        total_b_mem += b_ffn2d
+        total_mem += (w_ffn2d_mem + b_ffn2d_mem)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - FFN Layer 2",
+                input_shape=f"({p['batch_size']},{p['L_t']},{p['d_ff']})",
+                output_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+                wnum=w_ffn2d,bnum=b_ffn2d,comp=comp_ffn2d,
+                wmem=w_ffn2d_mem,bmem=b_ffn2d_mem
+            )
+        )
+
+        skip_ffn_d = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+        total_act_mem += skip_ffn_d
+        total_mem += skip_ffn_d
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - FFN Skip Connection",
+                actmem=skip_ffn_d
+            )
+        )
+
+        ln_w6 = p["d_model"]
+        ln_b6 = p["d_model"]
+        ln_w6_mem = ln_w6*precision
+        ln_b6_mem = ln_b6*precision
+        ln_act6 = p["batch_size"]*p["L_t"]*p["d_model"]*precision
+        comp_ln6 = ln_comp_dec()
+        total_comp_no_flash += comp_ln6
+        total_w_mem += ln_w6_mem
+        total_b_mem += ln_b6
+        total_act_mem += ln_act6
+        total_mem += (ln_w6_mem + ln_b6_mem + ln_act6)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - FFN LayerNorm",
+                wnum=ln_w6,bnum=ln_b6,comp=comp_ln6,
+                wmem=ln_w6_mem,bmem=ln_b6_mem,actmem=ln_act6
+            )
+        )
+
+    w_out_lin = p["d_model"]*p["V_tgt"]
+    b_out_lin = p["V_tgt"]
+    w_out_lin_mem = w_out_lin*precision
+    b_out_lin_mem = b_out_lin*precision
+    comp_out_lin = p["batch_size"]*p["L_t"]*p["d_model"]*p["V_tgt"]*2
+    out_lin_act = p["batch_size"]*p["L_t"]*p["V_tgt"]*precision
+    total_comp_no_flash += comp_out_lin
+    total_w_mem += w_out_lin_mem
+    total_b_mem += b_out_lin
+    total_act_mem += out_lin_act
+    total_mem += (w_out_lin_mem + b_out_lin_mem + out_lin_act)
+    rows.append(
+        mkrow(
+            name="Output Linear",
+            input_shape=f"({p['batch_size']},{p['L_t']},{p['d_model']})",
+            output_shape=f"({p['batch_size']},{p['L_t']},{p['V_tgt']})",
+            wnum=w_out_lin,bnum=b_out_lin,comp=comp_out_lin,
+            wmem=w_out_lin_mem,bmem=b_out_lin_mem,
+            actmem=out_lin_act
+        )
+    )
+
+    total_comp_with_flash = 0
+    if p["use_flash_attention"]:
+        comp_tile = flash_single_tile_comp(tile_m,tile_n,tile_k)
+        param_tile = flash_single_tile_params(p["d_model"], tile_k)
+        qkv_tile = flash_single_tile_qkv_data(tile_m,tile_n,tile_k)
+        kv_tile = flash_single_tile_kv_cache(tile_m,tile_n)
+        qkv_mem = qkv_tile*precision
+        kv_mem = kv_tile*precision
+        total_comp_with_flash = comp_tile
+        rows.append(
+            mkrow(
+                name="WithFlash Single-Tile Summary",
+                input_shape=f"(tile_m={tile_m}, tile_k={tile_k})",
+                output_shape=f"(tile_m={tile_m}, tile_n={tile_n})",
+                wnum=param_tile,bnum=0,
+                comp=comp_tile,
+                wmem=0,bmem=0,
+                actmem=qkv_mem,
+                kvcache=kv_mem,
+                qkv=qkv_tile
+            )
+        )
+
+    rows.append(
+        mkrow(
+            name="Computation Summary",
+            comp=total_comp_no_flash
+        )
+    )
+
+    return (
+        rows,
+        total_mem,
+        total_w_mem,
+        total_b_mem,
+        total_act_mem,
+        0,
+        total_comp_no_flash,
+        total_comp_with_flash
+    )
+
+(
+    module_list,
+    total_mem,
+    total_w_mem,
+    total_b_mem,
+    total_act_mem,
+    total_kv_mem,
+    total_comp_no_flash,
+    total_comp_with_flash
+) = calc_details()
+
+df = pd.DataFrame(module_list)
+
+def classify_mod_type(mname):
+    low = mname.lower()
+    if "encoder" in low:
+        return "Encoder"
+    elif "decoder" in low or "output linear" in low:
+        return "Decoder"
+    elif "withflash single-tile summary" in low or "computation summary" in low:
+        return "Other"
     else:
-        return 'その他'
+        return "Other"
 
-df['モジュールタイプ'] = df['モジュール'].apply(get_module_type)
+df["Module Type"] = df["Module"].apply(classify_mod_type)
+df["Input Elements"] = df["Input Shape"].apply(calculate_elements)
+df["Output Elements"] = df["Output Shape"].apply(calculate_elements)
 
-# 入出力テンソルサイズの計算
-df['入力要素数'] = df['入力サイズ'].apply(calculate_elements)
-df['出力要素数'] = df['出力サイズ'].apply(calculate_elements)
+st.header("Module Details")
+tabs = st.tabs(["All Modules","Encoder","Decoder","Other"])
+tab_all, tab_enc, tab_dec, tab_oth = tabs
 
-# 結果の表示
-st.header("各モジュールの詳細")
+with tab_all:
+    st.subheader("All Modules")
+    st.table(df)
+with tab_enc:
+    st.subheader("Encoder Modules")
+    st.table(df[df["Module Type"]=="Encoder"])
+with tab_dec:
+    st.subheader("Decoder Modules")
+    st.table(df[df["Module Type"]=="Decoder"])
+with tab_oth:
+    st.subheader("Other (Summaries / SingleTile)")
+    st.table(df[df["Module Type"]=="Other"])
 
-# テーブルの表示（数値のフォーマットを適用）
-st.table(df)
+st.write(f"**Total Memory**: {format_memory_size(total_mem)}")
+st.write(f"- Weight Memory: {format_memory_size(total_w_mem)}")
+st.write(f"- Bias Memory: {format_memory_size(total_b_mem)}")
+st.write(f"- Activation Memory: {format_memory_size(total_act_mem)}")
+if p["use_kv_cache"]:
+    st.write(f"- KV Cache Memory (per head allocated): {format_memory_size(total_kv_mem)}")
 
-# 合計メモリ使用量の表示
-st.write(f"**推定合計メモリ使用量**: {format_memory_size(total_memory)}")
-st.write(f"- 重みのメモリ合計: {format_memory_size(total_weight_memory)}")
-st.write(f"- バイアスのメモリ合計: {format_memory_size(total_bias_memory)}")
-st.write(f"- アクティベーションのメモリ合計: {format_memory_size(total_activation_memory)}")
-if use_kv_cache:
-    st.write(f"- KVキャッシュのメモリ合計: {format_memory_size(total_kv_cache_memory)}")
+st.write(f"**Without Flash** total computations: {int(total_comp_no_flash):,}")
+if p["use_flash_attention"]:
+    st.write(f"**With Flash (SingleTile)** computations: {int(total_comp_with_flash):,}")
 
-# FlashAttentionの有無による比較
-if use_flash_attention:
-    # FlashAttentionが有効な場合の計算量を計算
-    flash_computation = calculate_computation_with_flash_attention(
-        batch_size=batch_size,
-        h=h,
-        seq_len_q=L_s,
-        seq_len_k=L_s,
-        d_k=(d_model // h),
-        tile_size_m=tile_size_m,
-        tile_size_n=tile_size_n,
-        tile_size_k=tile_size_k
-    )
-    total_computation_with_flash = flash_computation
-    # FlashAttention使用時の計算量を表示
-    st.header("FlashAttentionによる最適化の効果")
-    reduction_ratio = (1 - total_computation_with_flash / total_computation_without_flash) * 100
-    st.write(f"**計算量の削減率**: {reduction_ratio:.2f}%")
-    st.write(f"- FlashAttention未使用時の総計算量: {int(total_computation_without_flash):,}")
-    st.write(f"- FlashAttention使用時の総計算量: {int(total_computation_with_flash):,}")
+st.header("Graphs")
+if "show_graphs" not in st.session_state:
+    st.session_state["show_graphs"] = True
 
-# グラフの表示
-
-# グラフの非表示・リセット機能の追加
-if 'show_graphs' not in st.session_state:
-    st.session_state['show_graphs'] = True
-
-if 'graph_filters' not in st.session_state:
-    st.session_state['graph_filters'] = {
-        '重みの数': True,
-        'バイアスの数': True,
-        '計算量': True,
-        '重みメモリ': True,
-        'バイアスメモリ': True,
-        'アクティベーションメモリ': True,
-        'KVキャッシュメモリ': True,
-        '入力サイズ/出力サイズ（要素数）': True
+if "graph_filters" not in st.session_state:
+    st.session_state["graph_filters"] = {
+        "Weights (#)": True,
+        "Biases (#)": True,
+        "Computations": True,
+        "Weight Memory": True,
+        "Bias Memory": True,
+        "Activation Memory": True,
+        "KV Cache Memory": True,
+        "Input/Output Elements": True,
+        "Show Input Embedding": True,
+        "Show Output Linear": True
     }
 
-# グラフの表示・非表示ボタン
 col1, col2 = st.columns(2)
 with col1:
-    if st.button("グラフを表示/非表示", key='toggle_graphs'):
-        st.session_state['show_graphs'] = not st.session_state['show_graphs']
+    if st.button("Toggle Graph Visibility"):
+        st.session_state["show_graphs"] = not st.session_state["show_graphs"]
 with col2:
-    if st.button("グラフフィルターをリセット", key='reset_graph_filters'):
-        st.session_state['graph_filters'] = {
-            '重みの数': True,
-            'バイアスの数': True,
-            '計算量': True,
-            '重みメモリ': True,
-            'バイアスメモリ': True,
-            'アクティベーションメモリ': True,
-            'KVキャッシュメモリ': True,
-            '入力サイズ/出力サイズ（要素数）': True
+    if st.button("Reset Graph Filters"):
+        st.session_state["graph_filters"] = {
+            "Weights (#)": True,
+            "Biases (#)": True,
+            "Computations": True,
+            "Weight Memory": True,
+            "Bias Memory": True,
+            "Activation Memory": True,
+            "KV Cache Memory": True,
+            "Input/Output Elements": True,
+            "Show Input Embedding": True,
+            "Show Output Linear": True
         }
 
-if st.session_state['show_graphs']:
-    st.subheader("グラフフィルターの設定")
-    with st.expander("グラフフィルターを設定"):
-        st.session_state['graph_filters']['重みの数'] = st.checkbox("重みの数", value=st.session_state['graph_filters']['重みの数'], key='filter_weights')
-        st.session_state['graph_filters']['バイアスの数'] = st.checkbox("バイアスの数", value=st.session_state['graph_filters']['バイアスの数'], key='filter_biases')
-        st.session_state['graph_filters']['計算量'] = st.checkbox("計算量", value=st.session_state['graph_filters']['計算量'], key='filter_computation')
-        st.session_state['graph_filters']['重みメモリ'] = st.checkbox("重みメモリ", value=st.session_state['graph_filters']['重みメモリ'], key='filter_weight_memory')
-        st.session_state['graph_filters']['バイアスメモリ'] = st.checkbox("バイアスメモリ", value=st.session_state['graph_filters']['バイアスメモリ'], key='filter_bias_memory')
-        st.session_state['graph_filters']['アクティベーションメモリ'] = st.checkbox("アクティベーションメモリ", value=st.session_state['graph_filters']['アクティベーションメモリ'], key='filter_activation_memory')
-        st.session_state['graph_filters']['KVキャッシュメモリ'] = st.checkbox("KVキャッシュメモリ", value=st.session_state['graph_filters']['KVキャッシュメモリ'], key='filter_kv_cache_memory')
-        st.session_state['graph_filters']['入力サイズ/出力サイズ（要素数）'] = st.checkbox("入力サイズ/出力サイズ（要素数）", value=st.session_state['graph_filters']['入力サイズ/出力サイズ（要素数）'], key='filter_tensor_sizes')
+if st.session_state["show_graphs"]:
+    st.subheader("Graph Filters")
+    with st.expander("Configure Graph Filters"):
+        st.session_state["graph_filters"]["Weights (#)"] = st.checkbox(
+            "Weights (#)", value=st.session_state["graph_filters"]["Weights (#)"]
+        )
+        st.session_state["graph_filters"]["Biases (#)"] = st.checkbox(
+            "Biases (#)", value=st.session_state["graph_filters"]["Biases (#)"]
+        )
+        st.session_state["graph_filters"]["Computations"] = st.checkbox(
+            "Computations", value=st.session_state["graph_filters"]["Computations"]
+        )
+        st.session_state["graph_filters"]["Weight Memory"] = st.checkbox(
+            "Weight Memory", value=st.session_state["graph_filters"]["Weight Memory"]
+        )
+        st.session_state["graph_filters"]["Bias Memory"] = st.checkbox(
+            "Bias Memory", value=st.session_state["graph_filters"]["Bias Memory"]
+        )
+        st.session_state["graph_filters"]["Activation Memory"] = st.checkbox(
+            "Activation Memory", value=st.session_state["graph_filters"]["Activation Memory"]
+        )
+        st.session_state["graph_filters"]["KV Cache Memory"] = st.checkbox(
+            "KV Cache Memory", value=st.session_state["graph_filters"]["KV Cache Memory"]
+        )
+        st.session_state["graph_filters"]["Input/Output Elements"] = st.checkbox(
+            "Input/Output Elements", value=st.session_state["graph_filters"]["Input/Output Elements"]
+        )
+        st.session_state["graph_filters"]["Show Input Embedding"] = st.checkbox(
+            "Include Input Embedding in Graphs",
+            value=st.session_state["graph_filters"]["Show Input Embedding"]
+        )
+        st.session_state["graph_filters"]["Show Output Linear"] = st.checkbox(
+            "Include Output Linear in Graphs",
+            value=st.session_state["graph_filters"]["Show Output Linear"]
+        )
 
-    # 重みの数のグラフ
-    if st.session_state['graph_filters']['重みの数'] or st.session_state['graph_filters']['バイアスの数']:
-        st.subheader("重みとバイアスの数")
-        weights_df = df[['モジュール', '重みの数', 'バイアスの数', 'モジュールタイプ']]
-        weights_df_melted = pd.melt(weights_df, id_vars=['モジュール', 'モジュールタイプ'],
-                                    value_vars=['重みの数', 'バイアスの数'],
-                                    var_name='パラメータタイプ', value_name='数')
-        weights_df_melted['数'] = weights_df_melted['数'].apply(lambda x: int(x.replace(',', '')))
-        # フィルタリング
-        weights_df_melted = weights_df_melted[weights_df_melted['パラメータタイプ'].isin(
-            [k for k, v in st.session_state['graph_filters'].items() if v and k in ['重みの数', 'バイアスの数']])]
-        fig_weights = px.bar(weights_df_melted, x='モジュール', y='数', color='パラメータタイプ',
-                             title='各モジュールの重みとバイアスの数', labels={'数': '数', 'モジュール': 'モジュール名'},
-                             barmode='group')
-        st.plotly_chart(fig_weights, use_container_width=True)
+    display_scope = st.radio("Display Modules for Graph:", ("Encoder Only","Decoder Only","Both"), index=2)
+    axis_scale = st.radio("Y-axis Scale", ("Linear","Log"), index=0)
 
-    # 計算量のグラフ
-    if st.session_state['graph_filters']['計算量']:
-        st.subheader("計算量")
-        computation_df = df[['モジュール', '計算量', 'モジュールタイプ']]
-        computation_df['計算量'] = computation_df['計算量'].apply(lambda x: int(x.replace(',', '')))
-        fig_computation = px.bar(computation_df, x='モジュール', y='計算量', color='モジュールタイプ',
-                                 title='各モジュールの計算量', labels={'計算量': '計算量', 'モジュール': 'モジュール名'})
-        st.plotly_chart(fig_computation, use_container_width=True)
+    def filter_df_for_graph(dfin):
+        if display_scope=="Encoder Only":
+            df_f = dfin[dfin["Module Type"]=="Encoder"]
+        elif display_scope=="Decoder Only":
+            df_f = dfin[dfin["Module Type"]=="Decoder"]
+        else:
+            df_f = dfin[dfin["Module Type"].isin(["Encoder","Decoder"])]
+        if not st.session_state["graph_filters"]["Show Input Embedding"]:
+            df_f = df_f[~df_f["Module"].str.contains("Encoder Input Embedding")]
+            df_f = df_f[~df_f["Module"].str.contains("Decoder Input Embedding")]
+        if not st.session_state["graph_filters"]["Show Output Linear"]:
+            df_f = df_f[df_f["Module"]!="Output Linear"]
+        return df_f
 
-    # メモリ使用量のグラフ
-    memory_types = ['重みメモリ', 'バイアスメモリ', 'アクティベーションメモリ', 'KVキャッシュメモリ']
-    selected_memory_types = [k for k, v in st.session_state['graph_filters'].items() if v and k in memory_types]
-    if selected_memory_types:
-        st.subheader("メモリ使用量")
-        memory_df = df[['モジュール', 'モジュールタイプ'] + memory_types]
+    def set_axis_scale(fig):
+        if axis_scale=="Log":
+            fig.update_yaxes(type="log")
+        return fig
 
-        # メモリサイズをバイト数に変換
-        def parse_memory_size(size_str):
-            if 'GB' in size_str:
-                return float(size_str.replace(' GB', '')) * (1024 ** 3)
-            elif 'MB' in size_str:
-                return float(size_str.replace(' MB', '')) * (1024 ** 2)
-            elif 'KB' in size_str:
-                return float(size_str.replace(' KB', '')) * 1024
-            elif 'B' in size_str:
-                return float(size_str.replace(' B', ''))
+    if st.session_state["graph_filters"]["Weights (#)"] or st.session_state["graph_filters"]["Biases (#)"]:
+        st.subheader("Weights and Biases (#)")
+        wdf = df[["Module","Weights (#)","Biases (#)","Module Type"]].copy()
+        wdf["Weights (#)"] = wdf["Weights (#)"].apply(parse_int_value)
+        wdf["Biases (#)"] = wdf["Biases (#)"].apply(parse_int_value)
+        wdf = filter_df_for_graph(wdf)
+        wdf_melted = pd.melt(
+            wdf,
+            id_vars=["Module","Module Type"],
+            value_vars=["Weights (#)","Biases (#)"],
+            var_name="ParamType",
+            value_name="Count"
+        )
+        active = []
+        if st.session_state["graph_filters"]["Weights (#)"]:
+            active.append("Weights (#)")
+        if st.session_state["graph_filters"]["Biases (#)"]:
+            active.append("Biases (#)")
+        wdf_melted = wdf_melted[wdf_melted["ParamType"].isin(active)]
+        if len(wdf_melted)>0:
+            fig = px.bar(
+                wdf_melted, x="Module", y="Count", color="ParamType",
+                title="Weights/Biases (#) per Module",
+                labels={"Count":"Count","Module":"Module"},
+                barmode="group"
+            )
+            fig = set_axis_scale(fig)
+            st.plotly_chart(fig,use_container_width=True)
+        else:
+            st.info("No modules for Weights/Biases (#).")
+
+    if st.session_state["graph_filters"]["Computations"]:
+        st.subheader("Computations")
+        cdf = df[["Module","Computations","Module Type"]].copy()
+        cdf["Computations"] = cdf["Computations"].apply(parse_float_value)
+        cdf = filter_df_for_graph(cdf)
+        if len(cdf)>0:
+            fig = px.bar(
+                cdf, x="Module", y="Computations", color="Module Type",
+                title="Computations per Module",
+                labels={"Computations":"Computations","Module":"Module"}
+            )
+            fig = set_axis_scale(fig)
+            st.plotly_chart(fig,use_container_width=True)
+        else:
+            st.info("No modules for Computations under current filter.")
+
+    mem_cols = ["Weight Memory","Bias Memory","Activation Memory","KV Cache Memory"]
+    sel_mems = []
+    if st.session_state["graph_filters"]["Weight Memory"]:
+        sel_mems.append("Weight Memory")
+    if st.session_state["graph_filters"]["Bias Memory"]:
+        sel_mems.append("Bias Memory")
+    if st.session_state["graph_filters"]["Activation Memory"]:
+        sel_mems.append("Activation Memory")
+    if st.session_state["graph_filters"]["KV Cache Memory"]:
+        sel_mems.append("KV Cache Memory")
+
+    if len(sel_mems)>0:
+        st.subheader("Memory Usage")
+        mdf = df[["Module","Module Type"]+mem_cols].copy()
+        mdf = filter_df_for_graph(mdf)
+        def parse_mem(s):
+            s = s.strip()
+            if "GB" in s:
+                return float(s.replace(" GB",""))*(1024**3)
+            elif "MB" in s:
+                return float(s.replace(" MB",""))*(1024**2)
+            elif "KB" in s:
+                return float(s.replace(" KB",""))*1024
+            elif "B" in s:
+                return float(s.replace(" B",""))
             else:
                 return 0
 
-        for col in memory_types:
-            memory_df[col + '_bytes'] = memory_df[col].apply(parse_memory_size)
+        for c in mem_cols:
+            mdf[c+"_bytes"] = mdf[c].apply(parse_mem)
 
-        memory_df_melted = pd.melt(memory_df, id_vars=['モジュール', 'モジュールタイプ'],
-                                   value_vars=[col + '_bytes' for col in memory_types],
-                                   var_name='メモリタイプ', value_name='メモリ使用量 (バイト)')
+        melted = pd.melt(
+            mdf,
+            id_vars=["Module","Module Type"],
+            value_vars=[c+"_bytes" for c in mem_cols],
+            var_name="MemType",
+            value_name="Memory (bytes)"
+        )
+        melted["MemType"] = melted["MemType"].str.replace("_bytes","")
+        melted = melted[melted["MemType"].isin(sel_mems)]
+        if len(melted)>0:
+            fig = px.bar(
+                melted,
+                x="Module", y="Memory (bytes)", color="MemType",
+                title="Memory Usage per Module",
+                labels={"Memory (bytes)":"Memory Usage","Module":"Module"},
+                barmode="stack"
+            )
+            fig = set_axis_scale(fig)
+            st.plotly_chart(fig,use_container_width=True)
+        else:
+            st.info("No memory columns matched the filter.")
 
-        # メモリタイプの名前を修正
-        memory_df_melted['メモリタイプ'] = memory_df_melted['メモリタイプ'].str.replace('_bytes', '')
-        # フィルタリング
-        memory_df_melted = memory_df_melted[memory_df_melted['メモリタイプ'].isin(selected_memory_types)]
-        fig_memory = px.bar(memory_df_melted, x='モジュール', y='メモリ使用量 (バイト)', color='メモリタイプ',
-                            title='各モジュールのメモリ使用量の内訳', labels={'メモリ使用量 (バイト)': 'メモリ使用量', 'モジュール': 'モジュール名'},
-                            barmode='stack')
-        st.plotly_chart(fig_memory, use_container_width=True)
-
-    # 入出力テンソルサイズのグラフ
-    if st.session_state['graph_filters']['入力サイズ/出力サイズ（要素数）']:
-        st.subheader("入出力テンソルサイズ（要素数）")
-        tensor_sizes_df = df[['モジュール', '入力要素数', '出力要素数', 'モジュールタイプ']]
-
-        tensor_sizes_melted = pd.melt(tensor_sizes_df, id_vars=['モジュール', 'モジュールタイプ'],
-                                      value_vars=['入力要素数', '出力要素数'],
-                                      var_name='テンソルタイプ', value_name='要素数')
-
-        fig_tensor_sizes = px.bar(tensor_sizes_melted, x='モジュール', y='要素数', color='テンソルタイプ',
-                                  title='各モジュールの入出力テンソルサイズ（要素数）', labels={'要素数': '要素数', 'モジュール': 'モジュール名'},
-                                  barmode='group')
-        st.plotly_chart(fig_tensor_sizes, use_container_width=True)
+    if st.session_state["graph_filters"]["Input/Output Elements"]:
+        st.subheader("Input/Output Tensor Elements")
+        iodf = df[["Module","Input Elements","Output Elements","Module Type"]].copy()
+        iodf = filter_df_for_graph(iodf)
+        if len(iodf)>0:
+            iodf["Input Elements"] = iodf["Input Elements"].astype(int)
+            iodf["Output Elements"] = iodf["Output Elements"].astype(int)
+            iodf_melted = pd.melt(
+                iodf,
+                id_vars=["Module","Module Type"],
+                value_vars=["Input Elements","Output Elements"],
+                var_name="TensorType",
+                value_name="Elements"
+            )
+            if len(iodf_melted)>0:
+                fig = px.bar(
+                    iodf_melted,
+                    x="Module", y="Elements", color="TensorType",
+                    title="Input/Output Tensor Elements",
+                    labels={"Elements":"Elements","Module":"Module"},
+                    barmode="group"
+                )
+                fig = set_axis_scale(fig)
+                st.plotly_chart(fig,use_container_width=True)
+            else:
+                st.info("No Input/Output elements matched filter.")
+        else:
+            st.info("No modules for Input/Output elements under current filter.")
