@@ -8,9 +8,6 @@ import base64
 import re
 import math
 
-# 定数
-LN_FACTOR = 5
-
 # パース系ユーティリティ
 def parse_int_value(x):
     if isinstance(x, str):
@@ -66,17 +63,23 @@ def calculate_elements(shape_str):
     return total
 
 # FlashAttention 関連
+# m = query tile rows, n = key/value tile rows, k = head dim (d_k)
 def flash_single_tile_comp(m, n, k):
-    return 2*m*n*k + (m*n) + 2*m*n*k
+    # QK^T: 2mnk, online softmax over n keys per row of m queries: ~5mn,
+    # softmax×V: 2mnk
+    return 2*m*n*k + 5*m*n + 2*m*n*k
 
 def flash_single_tile_params(d_model, tile_k):
+    # one head's worth of slice through one projection (Q, K or V): d_model × d_k
     return d_model * tile_k
 
 def flash_single_tile_qkv_data(m, n, k):
-    return (m*k) + (k*n) + (k*n)
+    # Q tile: (m,k), K tile: (n,k), V tile: (n,k)
+    return (m*k) + (n*k) + (n*k)
 
-def flash_single_tile_kv_cache(m, n):
-    return (m*n)*2
+def flash_single_tile_kv_cache(n, k):
+    # K and V tiles read into SRAM: each (n,k)
+    return 2*n*k
 
 # デフォルトパラメータ
 DEFAULT_PARAMS = {
@@ -84,8 +87,8 @@ DEFAULT_PARAMS = {
     "L_s": 50,
     "L_t": 50,
     "d_model": 512,
-    "N_enc": 6,
-    "N_dec": 6,
+    "N_enc": 1,
+    "N_dec": 1,
     "h": 8,
     "d_ff": 2048,
     "V_src": 30000,
@@ -95,7 +98,9 @@ DEFAULT_PARAMS = {
     "use_flash_attention": False,
     "tile_size_m": 128,
     "tile_size_n": 128,
-    "tile_size_k": 64
+    "tile_size_k": 64,
+    "kv_cache_layers": [1],
+    "kv_seq_length": 50
 }
 
 # パラメータ保存／読み込み関数
@@ -132,7 +137,7 @@ if st.sidebar.button("Reset to Default"):
 
 loaded = load_parameters()
 if loaded:
-    st.session_state['params'] = loaded
+    st.session_state['params'] = {**DEFAULT_PARAMS, **loaded}
     st.sidebar.success("Params loaded successfully")
 
 p = st.session_state['params']
@@ -144,6 +149,10 @@ p["d_model"] = st.sidebar.number_input("d_model", 1, 999999, value=p["d_model"])
 p["N_enc"] = st.sidebar.number_input("Encoder Layers (N_enc)", 1, 9999, value=p["N_enc"])
 p["N_dec"] = st.sidebar.number_input("Decoder Layers (N_dec)", 1, 9999, value=p["N_dec"])
 p["h"] = st.sidebar.number_input("Heads (h)", 1, 9999, value=p["h"])
+if p["d_model"] % p["h"] != 0:
+    st.sidebar.warning(
+        f"d_model ({p['d_model']}) is not divisible by h ({p['h']}); per-head dim will be truncated to {p['d_model'] // p['h']}."
+    )
 p["d_ff"] = st.sidebar.number_input("FeedForward Dim (d_ff)", 1, 999999, value=p["d_ff"])
 p["V_src"] = st.sidebar.number_input("V_src (Source Vocab)", 1, 999999, value=p["V_src"])
 p["V_tgt"] = st.sidebar.number_input("V_tgt (Target Vocab)", 1, 999999, value=p["V_tgt"])
@@ -155,9 +164,27 @@ dtype_map = {
     "int8 (1byte)":1
 }
 all_dtypes = list(dtype_map.keys())
-p["dtype_str"] = st.sidebar.selectbox("Data Type", all_dtypes, index=all_dtypes.index(p["dtype_str"]))
+dtype_idx = all_dtypes.index(p["dtype_str"]) if p["dtype_str"] in all_dtypes else all_dtypes.index(DEFAULT_PARAMS["dtype_str"])
+p["dtype_str"] = st.sidebar.selectbox("Data Type", all_dtypes, index=dtype_idx)
 
 p["use_kv_cache"] = st.sidebar.checkbox("Use KV Cache (per head)", value=p["use_kv_cache"])
+if p["use_kv_cache"]:
+    available_kv_layers = list(range(1, p["N_dec"] + 1))
+    saved_kv_layers = [l for l in p.get("kv_cache_layers", available_kv_layers) if l in available_kv_layers]
+    if not saved_kv_layers:
+        saved_kv_layers = available_kv_layers
+    p["kv_cache_layers"] = st.sidebar.multiselect(
+        "KV Cache Decoder Layers (1-indexed)",
+        options=available_kv_layers,
+        default=saved_kv_layers
+    )
+    p["kv_seq_length"] = st.sidebar.number_input(
+        "KV Cache Sequence Length",
+        min_value=0, max_value=2**20,
+        value=p.get("kv_seq_length", p["L_t"]),
+        help="Number of tokens stored in the cache (context + generated). Per-layer KV bytes = batch × kv_seq_length × d_model × 2 × precision."
+    )
+
 p["use_flash_attention"] = st.sidebar.checkbox("Use FlashAttention", value=p["use_flash_attention"])
 
 if p["use_flash_attention"]:
@@ -165,10 +192,6 @@ if p["use_flash_attention"]:
     p["tile_size_m"] = st.sidebar.number_input("tile_size_m", 1, 9999, value=p["tile_size_m"])
     p["tile_size_n"] = st.sidebar.number_input("tile_size_n", 1, 9999, value=p["tile_size_n"])
     p["tile_size_k"] = st.sidebar.number_input("tile_size_k", 1, 9999, value=p["tile_size_k"])
-else:
-    p["tile_size_m"] = 128
-    p["tile_size_n"] = 128
-    p["tile_size_k"] = 64
 
 # ★ サイドバー：ソフトマックスの演算モード選択 ★
 softmax_mode = st.sidebar.radio("Softmax Reduction Mode", ("Sequential (O(n))", "Parallel (O(log n))"))
@@ -212,8 +235,8 @@ def mkrow(
         "Bias Memory": format_memory_size(bmem),
         "Activation Memory": format_memory_size(actmem),
         "KV Cache Memory": format_memory_size(kvcache),
-        "QKV Data (#)": f"{qkv}" if qkv else "0",
-        "KV Cache (#)": f"{kv_elems}" if kv_elems else "0",
+        "QKV Data (#)": f"{qkv:,}" if qkv else "0",
+        "KV Cache (#)": f"{kv_elems:,}" if kv_elems else "0",
         "Total Memory": format_memory_size(wmem + bmem + actmem + kvcache),
         "Tile Executions": tile_ex,
         "Data Reuse Count": reuse_c
@@ -242,17 +265,20 @@ def calc_details():
     if ln_mode.startswith("Sequential"):
         ln_cost = 5 * d_model
     else:
-        ln_cost = 3 * d_model + 2 * math.log(d_model, 2) if d_model > 1 else 0
+        ln_cost = 3 * d_model + 2 * math.log(d_model, 2)
 
     def ln_comp_enc():
         return ln_cost * batch_size * L_s
     def ln_comp_dec():
         return ln_cost * batch_size * L_t
 
+    kv_layers_set = set(param.get("kv_cache_layers", list(range(1, N_dec + 1)))) if use_kv else set()
+
     rows = []
     total_w_mem = 0
     total_b_mem = 0
     total_act_mem = 0
+    total_kv_mem = 0
     total_mem = 0
     total_comp_no_flash = 0
 
@@ -274,26 +300,19 @@ def calc_details():
         )
     )
 
+    pe_enc_comp = batch_size * L_s * d_model
+    total_comp_no_flash += pe_enc_comp
+    rows.append(
+        mkrow(
+            name="Encoder Positional Encoding",
+            input_shape=f"({batch_size},{L_s},{d_model})",
+            output_shape=f"({batch_size},{L_s},{d_model})",
+            comp=pe_enc_comp
+        )
+    )
+
     for i in range(N_enc):
         layer_idx = i + 1
-        ln_w = d_model
-        ln_b = d_model
-        ln_wmem = ln_w * precision
-        ln_bmem = ln_b * precision
-        ln_act = batch_size * L_s * d_model * precision
-        comp_ln = ln_comp_enc()
-        total_comp_no_flash += comp_ln
-        total_w_mem += ln_wmem
-        total_b_mem += ln_b
-        total_act_mem += ln_act
-        total_mem += (ln_wmem + ln_bmem + ln_act)
-        rows.append(
-            mkrow(
-                name=f"Encoder Layer {layer_idx} - MHA LayerNorm",
-                wnum=ln_w, bnum=ln_b, comp=comp_ln,
-                wmem=ln_wmem, bmem=ln_bmem, actmem=ln_act
-            )
-        )
         w_mha = d_model * d_model * 3
         b_mha = d_model * 3
         w_mha_mem = w_mha * precision
@@ -303,7 +322,7 @@ def calc_details():
         qkv_mem = qkv_count * precision
         total_comp_no_flash += comp_mha
         total_w_mem += w_mha_mem
-        total_b_mem += b_mha
+        total_b_mem += b_mha_mem
         total_act_mem += qkv_mem
         total_mem += (w_mha_mem + b_mha_mem + qkv_mem)
         rows.append(
@@ -317,7 +336,7 @@ def calc_details():
             )
         )
         comp_qk = batch_size * h * L_s * L_s * (d_model // h) * 2
-        attn_score_mem = (comp_qk // 2) * precision
+        attn_score_mem = batch_size * h * L_s * L_s * precision
         total_comp_no_flash += comp_qk
         total_act_mem += attn_score_mem
         total_mem += attn_score_mem
@@ -339,7 +358,7 @@ def calc_details():
         if softmax_mode.startswith("Sequential"):
             cost_soft = 5 * L_s
         else:
-            cost_soft = 3 * L_s + 2 * math.log(L_s, 2) if L_s > 1 else 0
+            cost_soft = 3 * L_s + 2 * math.log(L_s, 2)
         comp_soft = batch_size * h * L_s * cost_soft
         total_comp_no_flash += comp_soft
         rows.append(
@@ -367,25 +386,30 @@ def calc_details():
         w_out_mem = w_out * precision
         b_out_mem = b_out * precision
         comp_out = batch_size * L_s * d_model * d_model * 2
+        out_mha_act = batch_size * L_s * d_model * precision
         total_comp_no_flash += comp_out
         total_w_mem += w_out_mem
-        total_b_mem += b_out
-        total_mem += (w_out_mem + b_out_mem)
+        total_b_mem += b_out_mem
+        total_act_mem += out_mha_act
+        total_mem += (w_out_mem + b_out_mem + out_mha_act)
         rows.append(
             mkrow(
                 name=f"Encoder Layer {layer_idx} - MHA Output Linear",
                 input_shape=f"({batch_size},{L_s},{d_model})",
                 output_shape=f"({batch_size},{L_s},{d_model})",
                 wnum=w_out, bnum=b_out, comp=comp_out,
-                wmem=w_out_mem, bmem=b_out_mem
+                wmem=w_out_mem, bmem=b_out_mem, actmem=out_mha_act
             )
         )
         skip_mem = batch_size * L_s * d_model * precision
+        skip_comp = batch_size * L_s * d_model
         total_act_mem += skip_mem
         total_mem += skip_mem
+        total_comp_no_flash += skip_comp
         rows.append(
             mkrow(
                 name=f"Encoder Layer {layer_idx} - Skip Connection",
+                comp=skip_comp,
                 actmem=skip_mem
             )
         )
@@ -397,12 +421,12 @@ def calc_details():
         comp_ln2 = ln_comp_enc()
         total_comp_no_flash += comp_ln2
         total_w_mem += ln_w2_mem
-        total_b_mem += ln_b2
+        total_b_mem += ln_b2_mem
         total_act_mem += ln_act2
         total_mem += (ln_w2_mem + ln_b2_mem + ln_act2)
         rows.append(
             mkrow(
-                name=f"Encoder Layer {layer_idx} - MHA LayerNorm (Post)",
+                name=f"Encoder Layer {layer_idx} - MHA LayerNorm",
                 wnum=ln_w2, bnum=ln_b2, comp=comp_ln2,
                 wmem=ln_w2_mem, bmem=ln_b2_mem, actmem=ln_act2
             )
@@ -411,11 +435,11 @@ def calc_details():
         b_ffn1 = d_ff
         w_ffn1_mem = w_ffn1 * precision
         b_ffn1_mem = b_ffn1 * precision
-        comp_ffn1 = batch_size * L_s * d_model * d_ff * 2
+        comp_ffn1 = batch_size * L_s * d_model * d_ff * 2 + batch_size * L_s * d_ff
         ffn1_mem = batch_size * L_s * d_ff * precision
         total_comp_no_flash += comp_ffn1
         total_w_mem += w_ffn1_mem
-        total_b_mem += b_ffn1
+        total_b_mem += b_ffn1_mem
         total_act_mem += ffn1_mem
         total_mem += (w_ffn1_mem + b_ffn1_mem + ffn1_mem)
         rows.append(
@@ -432,25 +456,30 @@ def calc_details():
         w_ffn2_mem = w_ffn2 * precision
         b_ffn2_mem = b_ffn2 * precision
         comp_ffn2 = batch_size * L_s * d_ff * d_model * 2
+        ffn2_act_mem = batch_size * L_s * d_model * precision
         total_comp_no_flash += comp_ffn2
         total_w_mem += w_ffn2_mem
-        total_b_mem += b_ffn2
-        total_mem += (w_ffn2_mem + b_ffn2_mem)
+        total_b_mem += b_ffn2_mem
+        total_act_mem += ffn2_act_mem
+        total_mem += (w_ffn2_mem + b_ffn2_mem + ffn2_act_mem)
         rows.append(
             mkrow(
                 name=f"Encoder Layer {layer_idx} - FFN Layer 2",
                 input_shape=f"({batch_size},{L_s},{d_ff})",
                 output_shape=f"({batch_size},{L_s},{d_model})",
                 wnum=w_ffn2, bnum=b_ffn2, comp=comp_ffn2,
-                wmem=w_ffn2_mem, bmem=b_ffn2_mem
+                wmem=w_ffn2_mem, bmem=b_ffn2_mem, actmem=ffn2_act_mem
             )
         )
         skip_ffn = batch_size * L_s * d_model * precision
+        skip_ffn_comp = batch_size * L_s * d_model
         total_act_mem += skip_ffn
         total_mem += skip_ffn
+        total_comp_no_flash += skip_ffn_comp
         rows.append(
             mkrow(
                 name=f"Encoder Layer {layer_idx} - FFN Skip Connection",
+                comp=skip_ffn_comp,
                 actmem=skip_ffn
             )
         )
@@ -462,7 +491,7 @@ def calc_details():
         comp_ln3 = ln_comp_enc()
         total_comp_no_flash += comp_ln3
         total_w_mem += ln_w3_mem
-        total_b_mem += ln_b3
+        total_b_mem += ln_b3_mem
         total_act_mem += ln_act3
         total_mem += (ln_w3_mem + ln_b3_mem + ln_act3)
         rows.append(
@@ -492,29 +521,19 @@ def calc_details():
         )
     )
 
-    def ln_comp_dec():
-        return ln_cost * batch_size * L_t
+    pe_dec_comp = batch_size * L_t * d_model
+    total_comp_no_flash += pe_dec_comp
+    rows.append(
+        mkrow(
+            name="Decoder Positional Encoding",
+            input_shape=f"({batch_size},{L_t},{d_model})",
+            output_shape=f"({batch_size},{L_t},{d_model})",
+            comp=pe_dec_comp
+        )
+    )
 
     for dec_i in range(N_dec):
         layer_name = dec_i + 1
-        ln_w4 = d_model
-        ln_b4 = d_model
-        ln_w4_mem = ln_w4 * precision
-        ln_b4_mem = ln_b4 * precision
-        ln_act4 = batch_size * L_t * d_model * precision
-        comp_ln4 = ln_comp_dec()
-        total_comp_no_flash += comp_ln4
-        total_w_mem += ln_w4_mem
-        total_b_mem += ln_b4
-        total_act_mem += ln_act4
-        total_mem += (ln_w4_mem + ln_b4_mem + ln_act4)
-        rows.append(
-            mkrow(
-                name=f"Decoder Layer {layer_name} - Masked MHA LayerNorm",
-                wnum=ln_w4, bnum=ln_b4, comp=comp_ln4,
-                wmem=ln_w4_mem, bmem=ln_b4_mem, actmem=ln_act4
-            )
-        )
         w_mha_dec = d_model * d_model * 3
         b_mha_dec = d_model * 3
         w_mha_dec_mem = w_mha_dec * precision
@@ -524,7 +543,7 @@ def calc_details():
         qkv_mem_dec = qkv_ct_dec * precision
         total_comp_no_flash += comp_mha_dec
         total_w_mem += w_mha_dec_mem
-        total_b_mem += b_mha_dec
+        total_b_mem += b_mha_dec_mem
         total_act_mem += qkv_mem_dec
         total_mem += (w_mha_dec_mem + b_mha_dec_mem + qkv_mem_dec)
         rows.append(
@@ -540,7 +559,7 @@ def calc_details():
             )
         )
         comp_qk_dec = batch_size * h * L_t * L_t * ((d_model // h)) * 2
-        qk_dec_mem = (comp_qk_dec // 2) * precision
+        qk_dec_mem = batch_size * h * L_t * L_t * precision
         total_comp_no_flash += comp_qk_dec
         total_act_mem += qk_dec_mem
         total_mem += qk_dec_mem
@@ -562,7 +581,7 @@ def calc_details():
         if softmax_mode.startswith("Sequential"):
             cost_soft_dec = 5 * L_t
         else:
-            cost_soft_dec = 3 * L_t + 2 * math.log(L_t, 2) if L_t > 1 else 0
+            cost_soft_dec = 3 * L_t + 2 * math.log(L_t, 2)
         comp_soft_dec = batch_size * h * L_t * cost_soft_dec
         total_comp_no_flash += comp_soft_dec
         rows.append(
@@ -577,32 +596,41 @@ def calc_details():
         total_comp_no_flash += comp_av_dec
         total_act_mem += av_dec_mem
         total_mem += av_dec_mem
-        kv_bytes = 0
-        if param["use_kv_cache"] and dec_i == 0:
-            d_k = d_model // h
-            if d_k > 0:
-                kv_count_per_layer = batch_size * h * L_t * d_k * 2
-                kv_count_all = kv_count_per_layer * N_dec
-                kv_bytes = kv_count_all * precision
-                total_mem += kv_bytes
         rows.append(
             mkrow(
                 name=f"Decoder Layer {layer_name} - Masked Attention Softmax×V",
                 comp=comp_av_dec,
                 output_shape=f"Context:({batch_size},{L_t},{d_model})",
-                actmem=av_dec_mem,
-                kvcache=kv_bytes
+                actmem=av_dec_mem
             )
         )
+        if use_kv and (dec_i + 1) in kv_layers_set:
+            d_k = d_model // h
+            if d_k > 0:
+                kv_seq_length = param.get("kv_seq_length", L_t)
+                kv_count_per_layer = batch_size * h * kv_seq_length * d_k * 2
+                kv_bytes = kv_count_per_layer * precision
+                total_mem += kv_bytes
+                total_kv_mem += kv_bytes
+                rows.append(
+                    mkrow(
+                        name=f"Decoder Layer {layer_name} - KV Cache (persistent)",
+                        input_shape=f"K,V:({batch_size},{h},{kv_seq_length},{d_k})",
+                        output_shape=f"K,V:({batch_size},{h},{kv_seq_length},{d_k})",
+                        kvcache=kv_bytes
+                    )
+                )
         w_out_dec = d_model * d_model
         b_out_dec = d_model
         w_out_dec_mem = w_out_dec * precision
         b_out_dec_mem = b_out_dec * precision
         comp_out_dec = batch_size * L_t * d_model * d_model * 2
+        out_mha_dec_act = batch_size * L_t * d_model * precision
         total_comp_no_flash += comp_out_dec
         total_w_mem += w_out_dec_mem
-        total_b_mem += b_out_dec
-        total_mem += (w_out_dec_mem + b_out_dec_mem)
+        total_b_mem += b_out_dec_mem
+        total_act_mem += out_mha_dec_act
+        total_mem += (w_out_dec_mem + b_out_dec_mem + out_mha_dec_act)
         rows.append(
             mkrow(
                 name=f"Decoder Layer {layer_name} - Masked MHA Output Linear",
@@ -610,15 +638,19 @@ def calc_details():
                 output_shape=f"({batch_size},{L_t},{d_model})",
                 wnum=w_out_dec, bnum=b_out_dec,
                 comp=comp_out_dec,
-                wmem=w_out_dec_mem, bmem=b_out_dec_mem
+                wmem=w_out_dec_mem, bmem=b_out_dec_mem,
+                actmem=out_mha_dec_act
             )
         )
         skip_mha = batch_size * L_t * d_model * precision
+        skip_mha_comp = batch_size * L_t * d_model
         total_act_mem += skip_mha
         total_mem += skip_mha
+        total_comp_no_flash += skip_mha_comp
         rows.append(
             mkrow(
-                name=f"Decoder Layer {layer_name} - Skip Connection (MHA)",
+                name=f"Decoder Layer {layer_name} - Skip Connection (Masked MHA)",
+                comp=skip_mha_comp,
                 actmem=skip_mha
             )
         )
@@ -630,25 +662,148 @@ def calc_details():
         comp_ln5 = ln_comp_dec()
         total_comp_no_flash += comp_ln5
         total_w_mem += ln_w5_mem
-        total_b_mem += ln_b5
+        total_b_mem += ln_b5_mem
         total_act_mem += ln_act5
         total_mem += (ln_w5_mem + ln_b5_mem + ln_act5)
         rows.append(
             mkrow(
-                name=f"Decoder Layer {layer_name} - MHA LayerNorm (Post)",
+                name=f"Decoder Layer {layer_name} - Masked MHA LayerNorm",
                 wnum=ln_w5, bnum=ln_b5, comp=comp_ln5,
                 wmem=ln_w5_mem, bmem=ln_b5_mem, actmem=ln_act5
+            )
+        )
+        # ── Cross-Attention (Q from decoder, K,V from encoder output) ──
+        w_cross = d_model * d_model * 3
+        b_cross = d_model * 3
+        w_cross_mem = w_cross * precision
+        b_cross_mem = b_cross * precision
+        # Q proj on L_t, K/V proj on L_s (encoder output)
+        comp_cross_qkv = batch_size * (L_t + 2 * L_s) * d_model * d_model * 2
+        qkv_ct_cross = batch_size * (L_t + 2 * L_s) * d_model
+        qkv_mem_cross = qkv_ct_cross * precision
+        total_comp_no_flash += comp_cross_qkv
+        total_w_mem += w_cross_mem
+        total_b_mem += b_cross_mem
+        total_act_mem += qkv_mem_cross
+        total_mem += (w_cross_mem + b_cross_mem + qkv_mem_cross)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention Linear Projections",
+                input_shape=f"Q-in:({batch_size},{L_t},{d_model});KV-in:({batch_size},{L_s},{d_model})",
+                output_shape=f"Q:({batch_size},{L_t},{d_model});K:({batch_size},{L_s},{d_model});V:({batch_size},{L_s},{d_model})",
+                wnum=w_cross, bnum=b_cross,
+                comp=comp_cross_qkv,
+                wmem=w_cross_mem, bmem=b_cross_mem,
+                actmem=qkv_mem_cross,
+                qkv=qkv_ct_cross
+            )
+        )
+        comp_qk_cross = batch_size * h * L_t * L_s * (d_model // h) * 2
+        qk_cross_mem = batch_size * h * L_t * L_s * precision
+        total_comp_no_flash += comp_qk_cross
+        total_act_mem += qk_cross_mem
+        total_mem += qk_cross_mem
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention QK^T",
+                comp=comp_qk_cross,
+                actmem=qk_cross_mem
+            )
+        )
+        comp_scale_cross = batch_size * h * L_t * L_s
+        total_comp_no_flash += comp_scale_cross
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention Scaling",
+                comp=comp_scale_cross
+            )
+        )
+        if softmax_mode.startswith("Sequential"):
+            cost_soft_cross = 5 * L_s
+        else:
+            cost_soft_cross = 3 * L_s + 2 * math.log(L_s, 2)
+        comp_soft_cross = batch_size * h * L_t * cost_soft_cross
+        total_comp_no_flash += comp_soft_cross
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention Softmax",
+                comp=comp_soft_cross
+            )
+        )
+        comp_av_cross = batch_size * h * L_t * L_s * (d_model // h) * 2
+        av_cross_ct = batch_size * L_t * d_model
+        av_cross_mem = av_cross_ct * precision
+        total_comp_no_flash += comp_av_cross
+        total_act_mem += av_cross_mem
+        total_mem += av_cross_mem
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention Softmax×V",
+                comp=comp_av_cross,
+                output_shape=f"Context:({batch_size},{L_t},{d_model})",
+                actmem=av_cross_mem
+            )
+        )
+        w_out_cross = d_model * d_model
+        b_out_cross = d_model
+        w_out_cross_mem = w_out_cross * precision
+        b_out_cross_mem = b_out_cross * precision
+        comp_out_cross = batch_size * L_t * d_model * d_model * 2
+        out_cross_act = batch_size * L_t * d_model * precision
+        total_comp_no_flash += comp_out_cross
+        total_w_mem += w_out_cross_mem
+        total_b_mem += b_out_cross_mem
+        total_act_mem += out_cross_act
+        total_mem += (w_out_cross_mem + b_out_cross_mem + out_cross_act)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention Output Linear",
+                input_shape=f"({batch_size},{L_t},{d_model})",
+                output_shape=f"({batch_size},{L_t},{d_model})",
+                wnum=w_out_cross, bnum=b_out_cross, comp=comp_out_cross,
+                wmem=w_out_cross_mem, bmem=b_out_cross_mem,
+                actmem=out_cross_act
+            )
+        )
+        skip_cross_mem = batch_size * L_t * d_model * precision
+        skip_cross_comp = batch_size * L_t * d_model
+        total_act_mem += skip_cross_mem
+        total_mem += skip_cross_mem
+        total_comp_no_flash += skip_cross_comp
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Skip Connection (Cross-Attention)",
+                comp=skip_cross_comp,
+                actmem=skip_cross_mem
+            )
+        )
+        ln_w_cross = d_model
+        ln_b_cross = d_model
+        ln_w_cross_mem = ln_w_cross * precision
+        ln_b_cross_mem = ln_b_cross * precision
+        ln_act_cross = batch_size * L_t * d_model * precision
+        comp_ln_cross = ln_comp_dec()
+        total_comp_no_flash += comp_ln_cross
+        total_w_mem += ln_w_cross_mem
+        total_b_mem += ln_b_cross_mem
+        total_act_mem += ln_act_cross
+        total_mem += (ln_w_cross_mem + ln_b_cross_mem + ln_act_cross)
+        rows.append(
+            mkrow(
+                name=f"Decoder Layer {layer_name} - Cross-Attention LayerNorm",
+                wnum=ln_w_cross, bnum=ln_b_cross, comp=comp_ln_cross,
+                wmem=ln_w_cross_mem, bmem=ln_b_cross_mem, actmem=ln_act_cross
             )
         )
         w_ffn1d = d_ff * d_model
         b_ffn1d = d_ff
         w_ffn1d_mem = w_ffn1d * precision
         b_ffn1d_mem = b_ffn1d * precision
-        comp_ffn1d = batch_size * L_t * d_model * d_ff * 2
+        comp_ffn1d = batch_size * L_t * d_model * d_ff * 2 + batch_size * L_t * d_ff
         ffn1d_act = batch_size * L_t * d_ff * precision
         total_comp_no_flash += comp_ffn1d
         total_w_mem += w_ffn1d_mem
-        total_b_mem += b_ffn1d
+        total_b_mem += b_ffn1d_mem
         total_act_mem += ffn1d_act
         total_mem += (w_ffn1d_mem + b_ffn1d_mem + ffn1d_act)
         rows.append(
@@ -665,25 +820,30 @@ def calc_details():
         w_ffn2d_mem = w_ffn2d * precision
         b_ffn2d_mem = b_ffn2d * precision
         comp_ffn2d = batch_size * L_t * d_ff * d_model * 2
+        ffn2d_act_mem = batch_size * L_t * d_model * precision
         total_comp_no_flash += comp_ffn2d
         total_w_mem += w_ffn2d_mem
-        total_b_mem += b_ffn2d
-        total_mem += (w_ffn2d_mem + b_ffn2d_mem)
+        total_b_mem += b_ffn2d_mem
+        total_act_mem += ffn2d_act_mem
+        total_mem += (w_ffn2d_mem + b_ffn2d_mem + ffn2d_act_mem)
         rows.append(
             mkrow(
                 name=f"Decoder Layer {layer_name} - FFN Layer 2",
                 input_shape=f"({batch_size},{L_t},{d_ff})",
                 output_shape=f"({batch_size},{L_t},{d_model})",
                 wnum=w_ffn2d, bnum=b_ffn2d, comp=comp_ffn2d,
-                wmem=w_ffn2d_mem, bmem=b_ffn2d_mem
+                wmem=w_ffn2d_mem, bmem=b_ffn2d_mem, actmem=ffn2d_act_mem
             )
         )
         skip_ffn_d = batch_size * L_t * d_model * precision
+        skip_ffn_d_comp = batch_size * L_t * d_model
         total_act_mem += skip_ffn_d
         total_mem += skip_ffn_d
+        total_comp_no_flash += skip_ffn_d_comp
         rows.append(
             mkrow(
                 name=f"Decoder Layer {layer_name} - FFN Skip Connection",
+                comp=skip_ffn_d_comp,
                 actmem=skip_ffn_d
             )
         )
@@ -695,7 +855,7 @@ def calc_details():
         comp_ln6 = ln_comp_dec()
         total_comp_no_flash += comp_ln6
         total_w_mem += ln_w6_mem
-        total_b_mem += ln_b6
+        total_b_mem += ln_b6_mem
         total_act_mem += ln_act6
         total_mem += (ln_w6_mem + ln_b6_mem + ln_act6)
         rows.append(
@@ -714,7 +874,7 @@ def calc_details():
     out_lin_act = batch_size * L_t * V_tgt * precision
     total_comp_no_flash += comp_out_lin
     total_w_mem += w_out_lin_mem
-    total_b_mem += b_out_lin
+    total_b_mem += b_out_lin_mem
     total_act_mem += out_lin_act
     total_mem += (w_out_lin_mem + b_out_lin_mem + out_lin_act)
     rows.append(
@@ -733,7 +893,7 @@ def calc_details():
         comp_tile = flash_single_tile_comp(tile_m, tile_n, tile_k)
         param_tile = flash_single_tile_params(d_model, tile_k)
         qkv_tile = flash_single_tile_qkv_data(tile_m, tile_n, tile_k)
-        kv_tile = flash_single_tile_kv_cache(tile_m, tile_n)
+        kv_tile = flash_single_tile_kv_cache(tile_n, tile_k)
         qkv_mem = qkv_tile * precision
         kv_mem = kv_tile * precision
         total_comp_with_flash = comp_tile
@@ -764,7 +924,7 @@ def calc_details():
         total_w_mem,
         total_b_mem,
         total_act_mem,
-        0,
+        total_kv_mem,
         total_comp_no_flash,
         total_comp_with_flash
     )
@@ -786,8 +946,6 @@ def classify_mod_type(mname):
         return "Encoder"
     elif "decoder" in low or "output linear" in low:
         return "Decoder"
-    elif "withflash single-tile summary" in low or "computation summary" in low:
-        return "Other"
     else:
         return "Other"
 
@@ -898,6 +1056,8 @@ if st.session_state["show_graphs"]:
 
     display_scope = st.radio("Display Modules for Graph:", ("Encoder Only", "Decoder Only", "Both"), index=2)
     axis_scale = st.radio("Y-axis Scale", ("Linear", "Log"), index=0)
+    graph_height_level = st.radio("Graph Height", ("Small", "Medium", "Large"), index=1)
+    graph_height = {"Small": 450, "Medium": 900, "Large": 1350}[graph_height_level]
 
     def filter_df_for_graph(dfin):
         if display_scope == "Encoder Only":
@@ -916,7 +1076,15 @@ if st.session_state["show_graphs"]:
     def set_axis_scale(fig):
         if axis_scale == "Log":
             fig.update_yaxes(type="log")
+        fig.update_layout(height=graph_height)
         return fig
+
+    def replace_zeros_for_log(values):
+        if axis_scale != "Log":
+            return values
+        if isinstance(values, pd.Series):
+            return values.replace(0, 0.1)
+        return [v if v != 0 else 0.1 for v in values]
 
     if st.session_state["graph_filters"]["Weights (#)"] or st.session_state["graph_filters"]["Biases (#)"]:
         st.subheader("Weights and Biases (#)")
@@ -938,14 +1106,15 @@ if st.session_state["show_graphs"]:
             active.append("Biases (#)")
         wdf_melted = wdf_melted[wdf_melted["ParamType"].isin(active)]
         if len(wdf_melted) > 0:
+            wdf_melted["Count"] = replace_zeros_for_log(wdf_melted["Count"])
             fig = px.bar(
                 wdf_melted, x="Module", y="Count", color="ParamType",
                 title="Weights/Biases (#) per Module",
-                labels={"Count": "Count", "Module": "Module"},
+                labels={"Count": "Count (words)", "Module": "Module"},
                 barmode="group"
             )
             fig = set_axis_scale(fig)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.info("No modules for Weights/Biases (#).")
 
@@ -955,13 +1124,14 @@ if st.session_state["show_graphs"]:
         cdf["Computations"] = cdf["Computations"].apply(parse_float_value)
         cdf = filter_df_for_graph(cdf)
         if len(cdf) > 0:
+            cdf["Computations"] = replace_zeros_for_log(cdf["Computations"])
             fig = px.bar(
                 cdf, x="Module", y="Computations", color="Module Type",
                 title="Computations per Module",
-                labels={"Computations": "Computations", "Module": "Module"}
+                labels={"Computations": "Computations (ops)", "Module": "Module"}
             )
             fig = set_axis_scale(fig)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.info("No modules for Computations under current filter.")
 
@@ -1004,15 +1174,16 @@ if st.session_state["show_graphs"]:
         melted["MemType"] = melted["MemType"].str.replace("_bytes", "")
         melted = melted[melted["MemType"].isin(sel_mems)]
         if len(melted) > 0:
+            melted["Memory (bytes)"] = replace_zeros_for_log(melted["Memory (bytes)"])
             fig = px.bar(
                 melted,
                 x="Module", y="Memory (bytes)", color="MemType",
                 title="Memory Usage per Module",
-                labels={"Memory (bytes)": "Memory Usage", "Module": "Module"},
+                labels={"Memory (bytes)": "Memory (bytes)", "Module": "Module"},
                 barmode="stack"
             )
             fig = set_axis_scale(fig)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         else:
             st.info("No memory columns matched the filter.")
 
@@ -1031,15 +1202,13 @@ if st.session_state["show_graphs"]:
                 value_name="Element Count"
             )
             if len(iodf_melted) > 0:
-                # 対数表示の場合、0はログが定義できないため、0を小さな正の値（例: 0.1）に置換
-                if axis_scale == "Log":
-                    iodf_melted["Element Count"] = iodf_melted["Element Count"].replace(0, 0.1)
+                iodf_melted["Element Count"] = replace_zeros_for_log(iodf_melted["Element Count"])
                 fig = px.bar(iodf_melted, x="Module", y="Element Count", color="Side",
                             title="Input vs Output Element Count per Module",
-                            labels={"Element Count": "Element Count", "Module": "Module", "Side": "Side"},
+                            labels={"Element Count": "Element Count (words)", "Module": "Module", "Side": "Side"},
                             barmode="group")
                 fig = set_axis_scale(fig)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width='stretch')
             else:
                 st.info("No Input/Output elements matched filter.")
         else:
@@ -1069,11 +1238,11 @@ if st.session_state["show_graphs"]:
     module_indices = list(range(len(modules)))
     input_x = [i - 0.2 for i in module_indices]
     output_x = [i + 0.2 for i in module_indices]
-    input_activation = df_grouped["Input_Activation"].tolist()
-    weights = df_grouped["Weights_Count"].tolist()
-    biases = df_grouped["Biases_Count"].tolist()
-    cache = df_grouped["KV_Cache_Count"].tolist()
-    output_vals = df_grouped["Output_Activation"].tolist()
+    input_activation = replace_zeros_for_log(df_grouped["Input_Activation"].tolist())
+    weights = replace_zeros_for_log(df_grouped["Weights_Count"].tolist())
+    biases = replace_zeros_for_log(df_grouped["Biases_Count"].tolist())
+    cache = replace_zeros_for_log(df_grouped["KV_Cache_Count"].tolist())
+    output_vals = replace_zeros_for_log(df_grouped["Output_Activation"].tolist())
 
     fig_agg = go.Figure()
     # 入力側：各内訳を積み上げ表示（同じ x 値）
@@ -1098,7 +1267,7 @@ if st.session_state["show_graphs"]:
     fig_agg.add_trace(go.Bar(
         x=input_x,
         y=cache,
-        name="Cache",
+        name="KV Cache",
         marker_color="orange"
     ))
     # 出力側：単独表示
@@ -1117,8 +1286,8 @@ if st.session_state["show_graphs"]:
             ticktext=modules,
             title="Module"
         ),
-        yaxis_title="Element Count"
+        yaxis_title="Element Count (words)"
     )
     fig_agg = set_axis_scale(fig_agg)
     st.header("Aggregated Element Count (Input Breakdown vs Output)")
-    st.plotly_chart(fig_agg, use_container_width=True)
+    st.plotly_chart(fig_agg, width='stretch')
